@@ -249,6 +249,18 @@
     <ClInclude Include="..\src\KeyboardHelp.h">
       <Filter>src</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\Library.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\LibraryPanel.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\LibraryReadingTracker.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\LibraryStore.h">
+      <Filter>src</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\LinkFollow.h">
       <Filter>src</Filter>
     </ClInclude>
@@ -382,6 +394,9 @@
       <Filter>src</Filter>
     </ClInclude>
     <ClInclude Include="..\src\ShortcutParse.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\SidebarLayout.h">
       <Filter>src</Filter>
     </ClInclude>
     <ClInclude Include="..\src\SimpleBrowserWindow.h">
@@ -816,6 +831,18 @@
       <Filter>src</Filter>
     </ClCompile>
     <ClCompile Include="..\src\KeyboardHelp_win.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\Library.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\LibraryPanel.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\LibraryReadingTracker.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\LibraryStore.cpp">
       <Filter>src</Filter>
     </ClCompile>
     <ClCompile Include="..\src\LinkFollow.cpp">

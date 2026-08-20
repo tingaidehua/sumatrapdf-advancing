@@ -15,67 +15,7 @@
 #include "Version.h"
 #include "AppTools.h"
 
-/* Returns true, if a Registry entry indicates that this executable has been
-   created by an installer (and should be updated through an installer) */
-static bool HasBeenInstalled() {
-    // see GetDefaultInstallationDir() in Installer.cpp
-    TempStr regPathUninst = str::JoinTemp(StrL("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"), kAppName);
-    TempStr installedPath = LoggedReadRegStr2Temp(regPathUninst, "InstallLocation");
-    if (!installedPath) {
-        return false;
-    }
-
-    TempStr exePath = GetSelfExePathTemp();
-    if (!str::EndsWithI(installedPath, StrL(".exe"))) {
-        installedPath = path::JoinTemp(installedPath.s, path::GetBaseNameTemp(exePath).s);
-    }
-    return path::IsSame(installedPath, exePath);
-}
-
-static bool PathStripBaseNameInPlace(Str& path) {
-    if (!path.s) {
-        return false;
-    }
-    TempStr base = path::GetBaseNameTemp(path);
-    if (base.s > path.s) {
-        base.s[-1] = 0;
-        path.len = (int)(base.s - path.s - 1);
-        return true;
-    }
-    return false;
-}
-
-// return true if path is in a given dir, even if dir is a junction etc.
-static bool IsPathInDirSmart(Str path, Str dir) {
-    TempStr work = str::DupTemp(path);
-    Str p = work;
-    while (p) {
-        if (path::IsSame(dir, p)) {
-            return true;
-        }
-        if (!PathStripBaseNameInPlace(p)) {
-            break;
-        }
-    }
-    return false;
-}
-
-static bool IsExeInProgramFiles() {
-    TempStr exePath = GetSelfExePathTemp();
-    TempStr dir = GetSpecialFolderTemp(CSIDL_PROGRAM_FILES);
-    if (IsPathInDirSmart(exePath, dir)) {
-        return true;
-    }
-    dir = GetSpecialFolderTemp(CSIDL_PROGRAM_FILESX86);
-    if (IsPathInDirSmart(exePath, dir)) {
-        return true;
-    }
-    return false;
-}
-
-/* Return false if this program has been started from "Program Files" directory
-   (which is an indicator that it has been installed) or from the last known
-   location of a SumatraPDF installation: */
+// This build always uses a relocatable, portable data root beside the EXE.
 bool IsRunningInPortableMode() {
     // cache the result so that it will be consistent during the lifetime of the process
     static int sCacheIsPortable = -1; // -1 == uninitialized, 0 == installed, 1 == portable
@@ -88,13 +28,10 @@ bool IsRunningInPortableMode() {
         return false;
     }
 
-    if (HasBeenInstalled()) {
-        return false;
-    }
-
-    if (!IsExeInProgramFiles()) {
-        sCacheIsPortable = 1;
-    }
+    // This distribution is intentionally portable even if an older Sumatra
+    // installation is registered on the machine. The executable and its
+    // same-name data directory must move as one unit.
+    sCacheIsPortable = 1;
     return sCacheIsPortable != 0;
 }
 
@@ -139,10 +76,17 @@ TempStr GetAppDataDirTemp() {
     if (gAppDataDir) {
         return gAppDataDir.s;
     }
-    bool isPortable = IsRunningInPortableMode();
+    // The shipped build is always relocatable; do not consult installation
+    // detection or registry state when choosing its writable data root.
+    bool isPortable = true;
     TempStr dir = nullptr;
     if (isPortable) {
-        dir = GetSelfExeDirTemp();
+        // Portable distributions keep all mutable state beside the executable
+        // in a folder named after it. Moving the EXE together with this folder
+        // therefore preserves settings, cache, database, logs and WebView data.
+        TempStr exeBase = path::GetBaseNameTemp(GetSelfExePathTemp());
+        TempStr dataName = path::GetPathNoExtTemp(exeBase);
+        dir = path::JoinTemp(GetSelfExeDirTemp(), dataName);
         // sometimes people put executable in directory like c:\windows
         // and we can't write to it. in that case we'll fall back to %APPDATA%
         if (!dir::HasWriteAccess(dir)) {

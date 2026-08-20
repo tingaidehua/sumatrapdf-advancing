@@ -204,6 +204,12 @@ MainWindow::~MainWindow() {
     delete favLayout;
     delete favRoot;
 
+    if (libraryTreeView) {
+        delete libraryTreeView->treeModel;
+    }
+    delete libraryLayout;
+    delete libraryRoot;
+
     DestroyAIChatPanel(this);
 
     // owns chrome, the content row, the splitters and the slots
@@ -972,6 +978,14 @@ void UpdateControlsColors(MainWindow* win) {
         favTreeView->SetColors(txtCol, bgCol);
         if (win->favFilterEdit) {
             win->favFilterEdit->SetColors(txtCol, bgCol);
+        }
+    }
+
+    auto* libraryTreeView = win->libraryTreeView;
+    if (libraryTreeView) {
+        libraryTreeView->SetColors(txtCol, bgCol);
+        if (win->libraryFilterEdit) {
+            win->libraryFilterEdit->SetColors(txtCol, bgCol);
         }
     }
 }

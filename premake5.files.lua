@@ -86,6 +86,14 @@ function zlib_files()
   })
 end
 
+function sqlite_files()
+  files_in_dir("ext/a-sqlite", {
+    "sqlite3.c",
+    "sqlite3.h",
+    "version.txt",
+  })
+end
+
 function zlib_ng_files()
   files_in_dir("ext/zlib-ng", {
     "adler32.c",
@@ -674,6 +682,11 @@ function sumatrapdf_files()
     "KeyboardHelp.*",
     "KeyboardHelp_win.cpp",
     "LinkFollow.*",
+    "Library.*",
+    "LibraryPanel.*",
+    "LibraryStore.*",
+    "LibraryReadingTracker.*",
+    "SidebarLayout.*",
     "MainWindow.*",
     "Menu.*",
     "NavFilesInFolder.*",
@@ -1350,6 +1363,8 @@ function test_util_files()
     "DisplayMode.*",
     "DocProperties.*",
     "Flags.*",
+    "LibraryReadingTracker.*",
+    "LibraryStore.*",
     "FilterUtil.*",
     "PageRenderPolicy.*",
     "RefHoverDetect.*",

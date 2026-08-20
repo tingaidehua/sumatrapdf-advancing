@@ -29,6 +29,10 @@ extern const char* gIconMatchWholeWord;
 extern const char* gIconHomeList;
 extern const char* gIconHomeThumbnails;
 extern const char* gIconPin;
+extern const char* gIconHome;
+extern const char* gIconLibrary;
+extern const char* gIconBookmarks;
+extern const char* gIconPlus;
 
 struct Pixmap;
 

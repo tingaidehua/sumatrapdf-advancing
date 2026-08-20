@@ -31,6 +31,7 @@
 #include "SumatraPDF.h"
 #include "MainWindow.h"
 #include "WindowTab.h"
+#include "Tabs.h"
 #include "FileHistory.h"
 #include "Favorites.h"
 #include "SelectionTranslate.h"
@@ -381,6 +382,11 @@ static TempStr LayoutInfoResultTemp(Str action, int* exitCodeOut) {
 
     bool watching = gLayoutProbe.active && gLayoutProbe.win == win;
     out.Append(fmt("OK count=%d watching=%d\n", gLayoutProbe.count, watching ? 1 : 0));
+    int pdfTabs = 0;
+    for (WindowTab* tab : win->Tabs()) {
+        if (tab && tab->filePath && str::EndsWithI(tab->filePath, StrL(".pdf"))) pdfTabs++;
+    }
+    out.Append(fmt("state tabs=%d pdf-tabs=%d\n", win->TabCount(), pdfTabs));
     AppendHwndLayoutRect(out, win, StrL("frame"), win->hwndFrame);
     AppendHwndLayoutRect(out, win, StrL("canvas"), win->hwndCanvas);
     AppendHwndLayoutRect(out, win, StrL("toolbar"), win->hwndToolbar);
@@ -388,6 +394,7 @@ static TempStr LayoutInfoResultTemp(Str action, int* exitCodeOut) {
     AppendHwndLayoutRect(out, win, StrL("menu"), win->hwndMenuReBar);
     AppendHwndLayoutRect(out, win, StrL("toc"), win->hwndTocBox);
     AppendHwndLayoutRect(out, win, StrL("favorites"), win->hwndFavBox);
+    AppendHwndLayoutRect(out, win, StrL("library"), win->hwndLibraryBox);
     AppendHwndLayoutRect(out, win, StrL("aiChat"), win->hwndAiChatBox);
 
     AppendLayoutTree(out, StrL("chrome"), win->chromeLayout);
@@ -395,6 +402,7 @@ static TempStr LayoutInfoResultTemp(Str action, int* exitCodeOut) {
     AppendLayoutTree(out, StrL("caption"), win->captionLayout);
     AppendLayoutTree(out, StrL("toc"), win->tocLayout);
     AppendLayoutTree(out, StrL("favorites"), win->favLayout);
+    AppendLayoutTree(out, StrL("library"), win->libraryLayout);
     AppendLayoutTree(out, StrL("aiChat"), win->aiChatLayout);
     AppendLayoutTree(out, StrL("homeSearch"), win->homeSearchLayout);
     return finish({}, 0);

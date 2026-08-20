@@ -1125,6 +1125,13 @@ const globalPrefs: Field[] = [
       "instead of the compact toolbar overlay",
   ).ver("3.7"),
   field("ShowFavorites", Bool, false, "if true, show the Favorites sidebar"),
+  field("ShowLibrary", Bool, true, "if true, show the Library sidebar").ver("3.7"),
+  field(
+    "LibraryDx",
+    Int,
+    280,
+    "width of the Library sidebar in screen pixels at 96 DPI; values below 160 use the default",
+  ).ver("3.7"),
   field(
     "SortFavoritesByName",
     Bool,
@@ -1232,9 +1239,9 @@ const globalPrefs: Field[] = [
     "IgnoreDestinationZoom",
     Bool,
     false,
-    "if true, going to a destination (clicking a bookmark or a link inside the document) keeps " +
-      "the current zoom instead of applying the zoom the destination asks for; it still goes to " +
-      "the page and the position. Same as Adobe Reader's 'forbid the change of the current zoom " +
+    "bookmarks always keep the reader's current zoom. If true, destination links inside the document " +
+      "also keep the current zoom instead of applying the zoom the destination asks for; links still go " +
+      "to the target page and position. Same as Adobe Reader's 'forbid the change of the current zoom " +
       "factor during execution of Go to Destination actions'",
   ).ver("3.7"),
   field(

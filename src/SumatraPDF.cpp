@@ -85,6 +85,9 @@
 #include "SearchAndDDE.h"
 #include "Selection.h"
 #include "LinkFollow.h"
+#include "Library.h"
+#include "LibraryPanel.h"
+#include "SidebarLayout.h"
 #include "SelectTextKeyboard.h"
 #include "KeyboardHelp.h"
 #include "SelectionToolbar.h"
@@ -185,7 +188,8 @@ bool gRedrawLog = false;
 Func1<MainWindow*> gAfterLayout;
 
 // returns false when the relayout was skipped (nothing layout-affecting changed)
-static bool RelayoutFrame(MainWindow* win, bool updateToolbars = true, int sidebarDx = -1);
+static bool RelayoutFrame(MainWindow* win, bool updateToolbars = true, int sidebarDx = -1,
+                          bool isSplitterDrag = false);
 static void UpdateOverlayScrollbarPositions(MainWindow* win);
 
 static Str HwndName(HWND hwnd) {
@@ -232,6 +236,7 @@ static StrVec gNextPrevDirCache; // cached files in gNextPrevDir
 static void CloseDocumentInCurrentTab(MainWindow* /*win*/, bool keepUIEnabled, bool deleteModel);
 static void SetFrameTitleForTab(WindowTab* tab, bool needRefresh);
 static void OnSidebarSplitterMove(VirtSplitter::MoveEvent* /*ev*/);
+static void OnLibrarySplitterMove(VirtSplitter::MoveEvent* /*ev*/);
 static void OnFavSplitterMove(VirtSplitter::MoveEvent* /*ev*/);
 
 EBookUI* GetEBookUI() {
@@ -2720,7 +2725,7 @@ void FrameSyncSplitters(MainWindow* win) {
     if (win->captionLayout) {
         CollectVirtCtrls(win->captionLayout, tops);
     }
-    VirtSplitter* all[] = {win->sidebarSplitter, win->favSplitter, win->aiChatSplitter};
+    VirtSplitter* all[] = {win->librarySplitter, win->sidebarSplitter, win->favSplitter, win->aiChatSplitter};
     for (VirtSplitter* s : all) {
         if (s) {
             tops.Append(s);
@@ -2782,13 +2787,17 @@ static void CreateCaptionLayout(MainWindow* win) {
     win->capRow2Lead = new Spacer(0, 0);
     win->capRow2Trail = new Spacer(0, 0);
 
-    // single row: sys | menu | tabs | gap | min | max/restore | close
-    // two row:     sys | menu hwnd | drag | min | max/restore | close
+    // single row: sys | menu | toolbar/tabs | gap | min | max/restore | close
+    // two row:     sys | menu hwnd | toolbar | drag | min | max/restore | close
     win->captionRow1 = new HBox();
-    win->captionRow1->alignCross = CrossAxisAlign::CrossEnd;
+    win->captionRow1->alignCross = CrossAxisAlign::CrossCenter;
     win->captionRow1->AddChild(win->capBtn[CB_SYSTEM_MENU]);
     win->captionRow1->AddChild(win->capBtn[CB_MENU]);
     win->captionRow1->AddChild(win->capMenuSlot);
+    // In the custom titlebar the document toolbar belongs in the same row as
+    // the menu/Home entry. This removes the former second toolbar row and
+    // gives the document viewport the reclaimed vertical space.
+    win->captionRow1->AddChild(win->captionToolbarSlot, 1);
     win->captionRow1->AddChild(win->capTabsRow1, 1);
     win->captionRow1->AddChild(win->capDrag1, 1);
     win->captionRow1->AddChild(win->capGap);
@@ -2817,6 +2826,7 @@ static void CreateCaptionLayout(MainWindow* win) {
 // The AI chat parts stay in the row even while that panel doesn't exist —
 // they are simply collapsed.
 static void CreateFrameLayout(MainWindow* win) {
+    win->librarySlot = new HwndSlot();
     win->tocSlot = new HwndSlot();
     win->favSlot = new HwndSlot();
     win->fullFavSlot = new HwndSlot();
@@ -2827,6 +2837,7 @@ static void CreateFrameLayout(MainWindow* win) {
     win->menuSlot = new HwndSlot();
     win->menuSlot->mapRtlX = true;
     win->toolbarTopSlot = new HwndSlot();
+    win->captionToolbarSlot = new HwndSlot();
     win->toolbarBottomSlot = new HwndSlot();
     CreateCaptionLayout(win);
 
@@ -2848,6 +2859,8 @@ static void CreateFrameLayout(MainWindow* win) {
 
     auto* row = new HBox();
     row->alignCross = CrossAxisAlign::Stretch;
+    row->AddChild(win->librarySlot);
+    row->AddChild(win->librarySplitter);
     row->AddChild(sidebar);
     row->AddChild(win->sidebarSplitter);
     row->AddChild(content, 1);
@@ -2868,6 +2881,11 @@ static void CreateFrameLayout(MainWindow* win) {
 }
 
 static void CreateSidebar(MainWindow* win) {
+    win->librarySplitter = NewFrameSplitter(SplitterType::Vert, true);
+    win->librarySplitter->thickness = kSplitterDx;
+    win->librarySplitter->onMove = MkFunc1Void(OnLibrarySplitterMove);
+    FrameSyncSplitters(win);
+
     win->sidebarSplitter = NewFrameSplitter(SplitterType::Vert, true);
     win->sidebarSplitter->thickness = kSplitterDx;
     win->sidebarSplitter->onMove = MkFunc1Void(OnSidebarSplitterMove);
@@ -2882,9 +2900,13 @@ static void CreateSidebar(MainWindow* win) {
 
     CreateFrameLayout(win);
 
+    CreateLibraryPanel(win);
     CreateFavorites(win);
 
     CreateAIChatPanel(win);
+
+    win->libraryDx = gGlobalPrefs->libraryDx;
+    win->uiState.libraryVisible = gGlobalPrefs->showLibrary && LibraryIsAvailable();
 
     if (win->uiState.tocVisible) {
         HwndRepaintNow(win->hwndTocBox);
@@ -2904,6 +2926,7 @@ static void UpdateToolbarSidebarText(MainWindow* win) {
     win->tocLabel->Invalidate();
     win->favLabel->SetText(_TRA("Favorites"));
     win->favLabel->Invalidate();
+    UpdateLibraryPanelText(win);
 }
 
 static Color DwmFrameBorderColorForCurrentTheme() {
@@ -3050,6 +3073,7 @@ static MainWindow* CreateMainWindow() {
         }
     }
     gWindows.Append(win);
+    RefreshLibraryPanel(win);
     ShowMaybeDelayedNotifications(win->hwndCanvas);
     // needed for RTL languages
     UpdateWindowRtlLayout(win);
@@ -3752,6 +3776,14 @@ MainWindow* LoadDocumentFinish(LoadArgs* args) {
         file::DeleteZoneIdentifier(fullPath);
     }
 
+    if (!lazyLoad) {
+        LibraryUpdateReadingActivity();
+        Str libraryTitle = currTab->displayName ? Str(currTab->displayName) : path::GetBaseNameTemp(path);
+        if (LibraryRecordOpenedDocument(path, libraryTitle)) {
+            RefreshLibraryPanels();
+        }
+    }
+
     return win;
 }
 
@@ -4422,6 +4454,8 @@ void LoadModelIntoTab(WindowTab* tab) {
         return;
     }
 
+    LibraryUpdateReadingActivity();
+
     MainWindow* win = tab->win;
     // Document content is about to change; drop any page-element / about-page tip
     // so it cannot linger over the new document.
@@ -4593,6 +4627,8 @@ void LoadModelIntoTab(WindowTab* tab) {
             ScheduleUiUpdate(win);
         }
         OnAIChatTabChanged(win);
+        LibraryUpdateReadingActivity();
+        RefreshLibraryPanels();
     }
 }
 
@@ -4803,6 +4839,7 @@ void PostAppExit() {
 // into the tab right afterwards and ReplaceDocumentInCurrentTab would revert
 // the UI disabling afterwards anyway)
 static void CloseDocumentInCurrentTab(MainWindow* win, bool keepUIEnabled, bool deleteModel) {
+    LibraryUpdateReadingActivity();
     // tear down any in-place form-field edit before the model/engine goes away,
     // so the overlay's widget pointer can't dangle (cancel: don't write/re-render
     // a document that's being closed or reloaded)
@@ -6671,19 +6708,10 @@ static bool IsUiLayoutEq(UILayout* s1, UILayout* s2) {
     return s1->rc == s2->rc && s1->presentation == s2->presentation && s1->tabsInTitlebar == s2->tabsInTitlebar &&
            s1->isFullScreen == s2->isFullScreen && s1->tabsVisible == s2->tabsVisible &&
            s1->isToolbarVisible == s2->isToolbarVisible && s1->tocVisible == s2->tocVisible &&
-           s1->showFavorites == s2->showFavorites && s1->favoritesAsTab == s2->favoritesAsTab &&
-           s1->showMenuBarRebar == s2->showMenuBarRebar && s1->aiChatVisible == s2->aiChatVisible &&
-           s1->aiChatDx == s2->aiChatDx && s1->sidebarOnRight == s2->sidebarOnRight;
-}
-
-// Favorites-only must not reserve a tab row (issue #5861)
-static bool WinHasFileTabs(MainWindow* win) {
-    for (WindowTab* tab : win->Tabs()) {
-        if (!tab->IsNonDocumentTab()) {
-            return true;
-        }
-    }
-    return false;
+           s1->libraryVisible == s2->libraryVisible && s1->showFavorites == s2->showFavorites &&
+           s1->favoritesAsTab == s2->favoritesAsTab && s1->showMenuBarRebar == s2->showMenuBarRebar &&
+           s1->aiChatVisible == s2->aiChatVisible && s1->aiChatDx == s2->aiChatDx &&
+           s1->sidebarOnRight == s2->sidebarOnRight;
 }
 
 static void BindSlot(HwndSlot* slot, HWND hwnd, DeferWinPosHelper* dh, bool move) {
@@ -6708,19 +6736,6 @@ static void StretchHwndHeight(DeferWinPosHelper& dh, HWND hwnd, const Rect& want
     }
 }
 
-// Keep x/y/height, apply a new width. Used on a live sidebar-splitter drag so
-// the TOC (label, filter, tree) is not nudged 1-2px; only the right edge moves.
-static void StretchHwndWidth(DeferWinPosHelper& dh, HWND hwnd, int dx) {
-    if (!hwnd) {
-        return;
-    }
-    Rect cur = ChildPosWithinParent(hwnd);
-    Rect next{cur.x, cur.y, dx, cur.dy};
-    if (next != cur) {
-        dh.MoveWindow(hwnd, next);
-    }
-}
-
 // sizes and shows the caption-tree children for the current mode (single row
 // vs. menu-bar + tabs). RelayoutFrame measures the tree after this; the
 // buttons' lastBounds become captionBtn[].rect
@@ -6735,7 +6750,7 @@ static void SyncCaptionLayout(MainWindow* win) {
     int tabHeight = GetTabbarHeight(win->hwndFrame);
     int pad = needPad ? kCaptionTopPadding : 0;
     int menuBarDy = twoRow ? GetMenuBarRebarHeight(win) : 0;
-    bool hasFileTabs = WinHasFileTabs(win);
+    bool hasFileTabs = false;
 
     win->captionRow1->rtl = isRtl;
     win->captionRow2->rtl = isRtl;
@@ -6789,13 +6804,13 @@ static void SyncCaptionLayout(MainWindow* win) {
         win->capRow2Lead->dx = winBtn;
         win->capRow2Trail->dx = 3 * winBtn;
         if (win->tabsCtrl) {
-            win->tabsVisible = hasFileTabs;
-            win->tabsCtrl->SetIsVisible(hasFileTabs);
+            win->tabsVisible = false;
+            win->tabsCtrl->SetIsVisible(false);
         }
     }
 }
 
-static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
+static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, bool isSplitterDrag) {
     DpiSetFromHwnd(win->hwndFrame);
     Rect rc = HwndClientRect(win->hwndFrame);
     // don't relayout while the window is minimized
@@ -6811,6 +6826,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     curState.tabsVisible = win->tabsVisible;
     curState.isToolbarVisible = win->isToolbarVisible;
     curState.tocVisible = win->uiState.tocVisible;
+    curState.libraryVisible = win->uiState.libraryVisible;
     bool favAsTabNow = win->CurrentTab() && win->CurrentTab()->IsFavoritesTab();
     // showFavorites covers both sidebar panel and full-window tab; favoritesAsTab
     // must differ so switching between them never skips RelayoutFrame (otherwise
@@ -6856,7 +6872,10 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         bool favAsTab = cur && cur->IsFavoritesTab();
         bool favVis = favAsTab || ui.favVisible;
         bool tocVis = !favAsTab && ui.tocVisible;
+        bool libraryVis = !favAsTab && ui.libraryVisible;
         bool aiVis = !favAsTab && ui.aiChatVisible;
+        win->librarySplitter->SetIsVisible(libraryVis);
+        HwndSetVisible(win->hwndLibraryBox, libraryVis);
         win->sidebarSplitter->SetIsVisible(!favAsTab && (tocVis || favVis));
         HwndSetVisible(win->hwndTocBox, tocVis);
         win->favSplitter->SetIsVisible(tocVis && favVis);
@@ -6905,7 +6924,6 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     // splitter drag (sidebarDx >= 0) is a live sibling resize: WM_SETREDRAW
     // would hide the frame on every mouse move and flash the TOC through the
     // transparent WebView2 in the strip the canvas just inherited
-    bool isSplitterDrag = sidebarDx != -1;
     // Fullscreen changes both the canvas origin and size while frame redraw is
     // disabled. Preserving its old screen bits copies the normal-window tabs,
     // toolbar, and document into the fullscreen surface until a later paint.
@@ -6929,6 +6947,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     bool favVisible = favAsTab || win->uiState.favVisible;
     bool tocVisible = !favAsTab && win->uiState.tocVisible;
     bool sidebarVisible = !favAsTab && (tocVisible || win->uiState.favVisible);
+    bool libraryVisible = !favAsTab && win->uiState.libraryVisible;
     bool aiChatVisible = !favAsTab && win->uiState.aiChatVisible && win->hwndAiChatBox;
     bool showCaption = !win->presentation && !win->isFullScreen && win->tabsInTitlebar;
     bool showingMenuBar = IsShowingMenuBarRebar(win);
@@ -6937,29 +6956,43 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     bool showToolbar = win->isToolbarVisible;
     bool toolbarBottom = showToolbar && ToolbarAtBottom();
 
+    int rebarDy = 0;
+    if (showToolbar && win->hwndToolbar) {
+        rebarDy = HwndWindowRect(win->hwndToolbar).dy;
+    }
+
+    // toolbarTopSlot is embedded in the custom caption row. Set its fixed
+    // height before measuring the caption so the row grows to the toolbar's
+    // actual native height instead of reserving a second chrome row.
+    win->toolbarTopSlot->dy = rebarDy;
+    win->captionToolbarSlot->dy = rebarDy;
+
     int tabHeight = GetTabbarHeight(win->hwndFrame);
     if (showCaption) {
         SyncCaptionLayout(win);
     }
     int captionHeight = showCaption ? win->captionLayout->Layout(ExpandInf()).dy : 0;
     int menuBarDy = showMenuRebar ? GetMenuBarRebarHeight(win) : 0;
-    int rebarDy = 0;
-    if (showToolbar && win->hwndToolbar) {
-        rebarDy = HwndWindowRect(win->hwndToolbar).dy;
-    }
 
     SetVis(win->captionLayout, showCaption);
     SetVis(win->tabsSlot, showTabsBar);
     SetVis(win->menuSlot, showMenuRebar);
-    SetVis(win->toolbarTopSlot, showToolbar && !toolbarBottom);
+    SetVis(win->toolbarTopSlot, !showCaption && showToolbar && !toolbarBottom);
+    SetVis(win->captionToolbarSlot, showCaption && showToolbar && !toolbarBottom);
     SetVis(win->toolbarBottomSlot, showToolbar && toolbarBottom);
     win->tabsSlot->dy = tabHeight;
     win->menuSlot->dy = menuBarDy;
-    win->toolbarTopSlot->dy = rebarDy;
     win->toolbarBottomSlot->dy = rebarDy;
 
     // leave at least this much canvas for the document when sidebar is open
     constexpr int kMinDocCanvasDx = 200;
+    int libraryDxApplied = 0;
+    if (libraryVisible) {
+        libraryDxApplied = win->libraryDx > 0 ? win->libraryDx : gGlobalPrefs->libraryDx;
+        int maxLibraryDx = std::max(kSidebarMinDx, rc.dx - kMinDocCanvasDx);
+        libraryDxApplied = limitValue(libraryDxApplied, kSidebarMinDx, maxLibraryDx);
+        win->libraryDx = libraryDxApplied;
+    }
     int sidebarDxApplied = 0;
     if (sidebarVisible) {
         if (sidebarDx > 0) {
@@ -6976,7 +7009,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         }
         // never too narrow; max leaves kMinDocCanvasDx for the document
         // (was hard-capped at half the frame, which cut long favorite names)
-        int maxSidebarDx = std::max(kSidebarMinDx, rc.dx - kMinDocCanvasDx);
+        int usedByLibrary = libraryVisible ? libraryDxApplied + kSplitterDx : 0;
+        int maxSidebarDx = std::max(kSidebarMinDx, rc.dx - usedByLibrary - kMinDocCanvasDx);
         sidebarDxApplied = limitValue(sidebarDxApplied, kSidebarMinDx, maxSidebarDx);
         win->sidebarDx = sidebarDxApplied; // remember what's applied
     }
@@ -6985,8 +7019,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     // 1px caption-border inset can disagree with the HWND's x. Only pin when
     // the sidebar is on the left: on the right, side.x is the right pane and
     // using it as rc.x stacked fav+canvas at the same x (issue-2165).
-    if ((isFrameResize || isSplitterDrag) && sidebarVisible && !SidebarOnRightLayout()) {
-        HWND sideHwnd = tocVisible ? win->hwndTocBox : win->hwndFavBox;
+    if ((isFrameResize || isSplitterDrag) && (libraryVisible || sidebarVisible) && !SidebarOnRightLayout()) {
+        HWND sideHwnd = libraryVisible ? win->hwndLibraryBox : (tocVisible ? win->hwndTocBox : win->hwndFavBox);
         if (sideHwnd) {
             Rect side = ChildPosWithinParent(sideHwnd);
             if (!side.IsEmpty()) {
@@ -6994,14 +7028,24 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
                 rc.x = side.x;
                 rc.dx = std::max(0, right - rc.x);
                 if (isFrameResize) {
-                    sidebarDxApplied = side.dx;
-                    win->sidebarDx = side.dx;
+                    if (libraryVisible) {
+                        libraryDxApplied = side.dx;
+                        win->libraryDx = side.dx;
+                    } else {
+                        sidebarDxApplied = side.dx;
+                        win->sidebarDx = side.dx;
+                    }
                 }
             }
         }
     }
 
-    int chromeDy = captionHeight + (showTabsBar ? tabHeight : 0) + menuBarDy + rebarDy;
+    // The top toolbar is a child of captionLayout in custom-titlebar mode, so
+    // captionHeight already includes it. Counting rebarDy again made the ToC
+    // 42px shorter than the sibling Library/canvas row and exposed stale
+    // canvas pixels along the bottom while resizing.
+    int toolbarOutsideCaptionDy = ToolbarDyOutsideCaption(showCaption, showToolbar, toolbarBottom, rebarDy);
+    int chromeDy = captionHeight + (showTabsBar ? tabHeight : 0) + menuBarDy + toolbarOutsideCaptionDy;
     int contentDy = std::max(rc.dy - chromeDy, 0);
 
     int tocDy = 0;
@@ -7025,13 +7069,16 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         if (aiChatDx <= 0) {
             aiChatDx = rc.dx * 3 / 8;
         }
-        int availDx = rc.dx - (sidebarVisible ? sidebarDxApplied + kSplitterDx : 0);
+        int availDx = rc.dx - (sidebarVisible ? sidebarDxApplied + kSplitterDx : 0) -
+                      (libraryVisible ? libraryDxApplied + kSplitterDx : 0);
         aiChatDx = limitValue(aiChatDx, kSidebarMinDx, availDx / 2);
         win->aiChatDx = aiChatDx;
     }
 
     // sidebar favorites vs. the full-window Favorites tab: same HWND, one slot
     bool sidebarFav = !favAsTab && win->uiState.favVisible;
+    SetVis(win->librarySlot, libraryVisible);
+    SetVis(win->librarySplitter, libraryVisible);
     SetVis(win->tocSlot, tocVisible);
     SetVis(win->favSlot, sidebarFav);
     SetVis(win->fullFavSlot, favAsTab);
@@ -7040,6 +7087,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     SetVis(win->aiChatSplitter, aiChatVisible);
     SetVis(win->aiChatSlot, aiChatVisible);
 
+    win->librarySlot->dx = libraryDxApplied;
     win->tocSlot->dx = sidebarDxApplied;
     win->tocSlot->dy = tocDy;
     win->favSlot->dx = sidebarDxApplied;
@@ -7048,20 +7096,25 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         win->frameLayout->rtl = SidebarOnRightLayout();
     }
 
-    // chrome HWNDs only move when updateToolbars (splitter drag skips them)
+    // Pane HWNDs move with a live splitter; unchanged chrome HWNDs only move
+    // when updateToolbars is requested.
     bool capTwoRow = showCaption && showingMenuBar;
-    bool capHasFileTabs = showCaption && WinHasFileTabs(win);
+    bool capHasFileTabs = false;
+    BindSlot(win->librarySlot, win->hwndLibraryBox, &dh, libraryVisible && !isFrameResize);
     BindSlot(win->tabsSlot, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh, updateToolbars && showTabsBar);
     BindSlot(win->menuSlot, win->hwndMenuReBar, &dh, updateToolbars && showMenuRebar);
     BindSlot(win->capMenuSlot, win->hwndMenuReBar, &dh, updateToolbars && capTwoRow);
     BindSlot(win->capTabsRow1, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh,
-             updateToolbars && showCaption && !capTwoRow);
+             updateToolbars && showCaption && !capTwoRow && capHasFileTabs);
     BindSlot(win->capTabsRow2, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh,
              updateToolbars && capTwoRow && capHasFileTabs);
-    BindSlot(win->toolbarTopSlot, win->hwndToolbar, &dh, updateToolbars && showToolbar && !toolbarBottom);
+    BindSlot(win->toolbarTopSlot, win->hwndToolbar, &dh,
+             updateToolbars && !showCaption && showToolbar && !toolbarBottom);
+    BindSlot(win->captionToolbarSlot, win->hwndToolbar, &dh,
+             updateToolbars && showCaption && showToolbar && !toolbarBottom);
     BindSlot(win->toolbarBottomSlot, win->hwndToolbar, &dh, updateToolbars && showToolbar && toolbarBottom);
-    BindSlot(win->tocSlot, win->hwndTocBox, &dh, tocVisible && !isFrameResize && !isSplitterDrag);
-    BindSlot(win->favSlot, win->hwndFavBox, &dh, sidebarFav && !isFrameResize && !isSplitterDrag);
+    BindSlot(win->tocSlot, win->hwndTocBox, &dh, tocVisible && !isFrameResize);
+    BindSlot(win->favSlot, win->hwndFavBox, &dh, sidebarFav && !isFrameResize);
     BindSlot(win->fullFavSlot, win->hwndFavBox, &dh, favAsTab);
     BindSlot(win->canvasSlot, win->hwndCanvas, &dh, !discardCanvasBits);
     BindSlot(win->aiChatSlot, win->hwndAiChatBox, &dh, aiChatVisible);
@@ -7074,24 +7127,21 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     // Frame resize: keep the sidebar's x/width, only stretch its height.
     // Splitter drag: keep x/y/height, only stretch its width.
     if (isFrameResize) {
+        if (libraryVisible) {
+            StretchHwndHeight(dh, win->hwndLibraryBox, win->librarySlot->lastBounds);
+        }
         if (tocVisible) {
             StretchHwndHeight(dh, win->hwndTocBox, win->tocSlot->lastBounds);
         }
         if (sidebarFav) {
             StretchHwndHeight(dh, win->hwndFavBox, win->favSlot->lastBounds);
         }
-    } else if (isSplitterDrag) {
-        if (tocVisible) {
-            StretchHwndWidth(dh, win->hwndTocBox, win->tocSlot->lastBounds.dx);
-        }
-        if (sidebarFav) {
-            StretchHwndWidth(dh, win->hwndFavBox, win->favSlot->lastBounds.dx);
-        }
     }
 
-    HwndSlot* chromeSlots[] = {win->tabsSlot,    win->menuSlot,    win->toolbarTopSlot, win->toolbarBottomSlot,
-                               win->capMenuSlot, win->capTabsRow1, win->capTabsRow2,    win->tocSlot,
-                               win->favSlot,     win->fullFavSlot, win->canvasSlot,     win->aiChatSlot};
+    HwndSlot* chromeSlots[] = {win->librarySlot,        win->tabsSlot,          win->menuSlot,    win->toolbarTopSlot,
+                               win->captionToolbarSlot, win->toolbarBottomSlot, win->capMenuSlot, win->capTabsRow1,
+                               win->capTabsRow2,        win->tocSlot,           win->favSlot,     win->fullFavSlot,
+                               win->canvasSlot,         win->aiChatSlot};
     for (HwndSlot* s : chromeSlots) {
         ClearSlotDefer(s);
     }
@@ -7120,6 +7170,27 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     }
 
     dh.End();
+
+    // The toolbar is a native VirtHost child while the surrounding chrome is
+    // laid out through HwndSlot. When a tab switch hides/shows a sidebar,
+    // Windows can retain the toolbar's old client origin even though its slot
+    // keeps the stable chrome origin. Re-apply the slot bounds once after the
+    // deferred batch so the toolbar cannot drift by one pixel relative to the
+    // Library/TOC panes.
+    if (updateToolbars && showToolbar && !toolbarBottom && win->hwndToolbar && libraryVisible) {
+        HwndSlot* toolbarSlot = showCaption ? win->captionToolbarSlot : win->toolbarTopSlot;
+        Rect want = toolbarSlot->lastBounds;
+        if (ChildPosWithinParent(win->hwndToolbar) != want) {
+            HwndMoveWindow(win->hwndToolbar, &want);
+        }
+    }
+
+    // The Library and ToC HWNDs are both created at x=0 before the first
+    // completed layout. Repaint Library after pane visibility/position changes
+    // so pixels drawn by the formerly overlapping ToC cannot remain in it.
+    if (libraryVisible && !isFrameResize && !isSplitterDrag) {
+        RedrawWindow(win->hwndLibraryBox, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
 
     if (isSplitterDrag) {
         if (discardCanvasBits) {
@@ -7163,6 +7234,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     // A frame-size drag does not move the splitter; invalidating it paints a
     // 1-2px strip against the TOC and looks like the tree is shimmering.
     if (!isFrameResize) {
+        if (libraryVisible) {
+            win->librarySplitter->Invalidate();
+        }
         if (tocVisible || favVisible) {
             win->sidebarSplitter->Invalidate();
         }
@@ -8781,10 +8855,13 @@ static void OnSidebarSplitterMove(VirtSplitter::MoveEvent* ev) {
 
     Point pcur = HwndGetCursorPos(win->hwndFrame);
     Rect rFrame = HwndClientRect(win->hwndFrame);
-    int sidebarDx = pcur.x; // without splitter
-    if (SidebarOnRightLayout()) {
-        sidebarDx = rFrame.dx - pcur.x;
+    HwndSlot* sidebarSlot = win->uiState.tocVisible ? win->tocSlot : win->favSlot;
+    Rect sidebarBounds = sidebarSlot ? sidebarSlot->lastBounds : Rect{};
+    if (sidebarBounds.IsEmpty()) {
+        ev->resizeAllowed = false;
+        return;
     }
+    int sidebarDx = SidebarDxFromCursor(sidebarBounds, pcur.x, SidebarOnRightLayout());
 
     // make sure to keep this in sync with the calculations in RelayoutFrame
     // note: without the min/max(..., curDx), the sidebar will be
@@ -8793,7 +8870,8 @@ static void OnSidebarSplitterMove(VirtSplitter::MoveEvent* ev) {
     int minDx = std::min(kSidebarMinDx, curDx);
     // match RelayoutFrame: allow wider than half window (long Favorites names)
     constexpr int kMinDocCanvasDx = 200;
-    int maxDx = std::max(rFrame.dx - kMinDocCanvasDx, curDx);
+    int libraryReserved = win->uiState.libraryVisible ? win->libraryDx + kSplitterDx : 0;
+    int maxDx = std::max(rFrame.dx - libraryReserved - kMinDocCanvasDx, curDx);
     if (sidebarDx < minDx || sidebarDx > maxDx) {
         ev->resizeAllowed = false;
         return;
@@ -8803,8 +8881,29 @@ static void OnSidebarSplitterMove(VirtSplitter::MoveEvent* ev) {
         return;
     }
 
-    // coalesces a burst of splitter moves into one relayout
-    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars, sidebarDx);
+    RelayoutFrame(win, false, sidebarDx, true);
+}
+
+static void OnLibrarySplitterMove(VirtSplitter::MoveEvent* ev) {
+    MainWindow* win = FindMainWindowByHwnd(ev->w->GetHwnd());
+    if (!win) return;
+    Point cursor = HwndGetCursorPos(win->hwndFrame);
+    Rect frame = HwndClientRect(win->hwndFrame);
+    int dx = SidebarOnRightLayout() ? frame.dx - cursor.x : cursor.x;
+    int current = win->libraryDx;
+    int minDx = std::min(kSidebarMinDx, current);
+    constexpr int kMinDocCanvasDx = 200;
+    int reserved = win->uiState.tocVisible || win->uiState.favVisible ? win->sidebarDx + kSplitterDx : 0;
+    int maxDx = std::max(frame.dx - reserved - kMinDocCanvasDx, current);
+    if (dx < minDx || dx > maxDx) {
+        ev->resizeAllowed = false;
+        return;
+    }
+    if (ev->queryOnly || dx == current) return;
+    win->libraryDx = dx;
+    gGlobalPrefs->libraryDx = dx;
+    win->uiState.layout = {};
+    RelayoutFrame(win, false, -1, true);
 }
 
 static void OnFavSplitterMove(VirtSplitter::MoveEvent* ev) {
@@ -8999,14 +9098,11 @@ static void CopySelectionInTabToClipboard(WindowTab* tab) {
     }
 }
 
-// this is a directory for not important data, like downloaded symbols
-// this directory is the same for installed / portable etc. versions
+// Directory for nonessential runtime data such as downloaded symbols. Keep it
+// inside the selected portable app-data root so moving the EXE remains self
+// contained.
 TempStr GetSumatraDataDirTemp() {
-    TempStr dir = GetSpecialFolderTemp(CSIDL_LOCAL_APPDATA, false);
-    if (!dir) {
-        return {};
-    }
-    return path::JoinTemp(dir, StrL("SumatraPDF-data"));
+    return path::JoinTemp(GetAppDataDirTemp(), StrL("SumatraPDF-data"));
 }
 
 TempStr GetSumatraBuildSpecificDirTemp() {
@@ -10689,6 +10785,15 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             }
             break;
 
+        case CmdToggleLibrary:
+            SetLibraryPanelVisible(win, !win->uiState.libraryVisible);
+            ToolbarUpdateStateForWindow(win, false);
+            break;
+
+        case CmdShowHome:
+            ShowHomeTab(win);
+            break;
+
         case CmdExpandToCurrentPage:
             ExpandTocToCurrentPage(win);
             break;
@@ -11903,11 +12008,11 @@ void RelayoutCaption(MainWindow* win) {
         return;
     }
     bool twoRow = IsShowingMenuBarRebar(win);
-    bool hasFileTabs = WinHasFileTabs(win);
+    bool hasFileTabs = false;
     DeferWinPosHelper dh;
     BindSlot(win->capMenuSlot, win->hwndMenuReBar, &dh, twoRow);
-    BindSlot(win->capTabsRow1, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh, !twoRow);
-    BindSlot(win->capTabsRow2, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh, twoRow && hasFileTabs);
+    BindSlot(win->capTabsRow1, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh, false);
+    BindSlot(win->capTabsRow2, win->tabsCtrl ? win->tabsCtrl->hwnd : nullptr, &dh, false);
     int dy = win->captionLayout->MinIntrinsicHeight(rc.dx);
     if (dy <= 0) {
         dy = rc.dy;
@@ -13454,7 +13559,7 @@ LRESULT CALLBACK WndProcSumatraFrame(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             // default COLOR_BTNFACE brush puts a bright #f0f0f0 band across a
             // dark sidebar, which reads as a light divider (issue #5893)
             HWND hwndCtl = (HWND)lp;
-            if (!win || (hwndCtl != win->hwndTocBox && hwndCtl != win->hwndFavBox)) {
+            if (!win || (hwndCtl != win->hwndTocBox && hwndCtl != win->hwndFavBox && hwndCtl != win->hwndLibraryBox)) {
                 break;
             }
             if (!win->brControlBgColor) {
@@ -13476,9 +13581,11 @@ LRESULT CALLBACK WndProcSumatraFrame(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 // topmost popups and must be dismissed on minimize or they
                 // stick on the desktop (issue #5928).
                 win->DeleteToolTip();
+                LibraryUpdateReadingActivity();
                 break;
             }
             if (win) {
+                LibraryUpdateReadingActivity();
                 RememberDefaultWindowPosition(win);
                 // UIState.layout.rc remembers the last laid-out client size;
                 // the scheduled update relayouts only when the size actually
@@ -13580,6 +13687,7 @@ LRESULT CALLBACK WndProcSumatraFrame(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 // home-page thumbnail tip is topmost track-mode; hide on deactivate
                 HomePageOnWindowActivate(win, false);
             }
+            LibraryUpdateReadingActivity();
             break;
 
         case WM_APPCOMMAND:

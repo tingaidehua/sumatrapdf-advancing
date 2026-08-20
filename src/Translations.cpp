@@ -157,7 +157,10 @@ Str GetTranslation(Str s) {
             return tr;
         }
     }
-    ReportDebugIf(true);
+    // Translation bundles can legitimately lag behind the current source
+    // strings (for example when reusing a portable install from an older
+    // SumatraPDF build). Keep the original English text for those entries;
+    // a stale bundle must not turn a language switch into a Debug assertion.
     return s;
 }
 

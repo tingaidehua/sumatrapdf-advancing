@@ -13,6 +13,7 @@ WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate = fa
 void TabsOnCloseWindow(MainWindow*);
 void TabsOnChangedDoc(MainWindow*);
 void TabsSelect(MainWindow* win, int tabIndex);
+void ShowHomeTab(MainWindow* win);
 void TabsOnCtrlTab(MainWindow* win, bool reverse);
 void UpdateTabWidth(MainWindow*);
 void SetTabsInTitlebar(MainWindow* win, bool inTitlebar);
@@ -23,4 +24,5 @@ TempStr MakeTabTooltipTemp(Str path, bool dirty = false);
 void CollectTabsToClose(MainWindow* win, WindowTab* currTab, Vec<WindowTab*>& toCloseOther,
                         Vec<WindowTab*>& toCloseRight, Vec<WindowTab*>& toCloseLeft);
 void CloseAllTabs(MainWindow*);
+void ShowTabContextMenu(WindowTab*, Point screenPt);
 void MoveTab(MainWindow* win, int dir);

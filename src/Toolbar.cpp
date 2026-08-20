@@ -62,6 +62,10 @@ struct ToolbarButtonInfo {
 };
 
 static ToolbarButtonInfo gToolbarButtons[] = {
+    {gIconHome, CmdShowHome, _TRN("Home")},
+    {gIconLibrary, CmdToggleLibrary, _TRN("Library")},
+    {gIconBookmarks, CmdToggleBookmarks, _TRN("Bookmarks")},
+    {nullptr, 0, nullptr}, // separator
     {gIconFileOpen, CmdOpenFile, _TRN("Open")},
     {gIconPrint, CmdPrint, _TRN("Print")},
     {nullptr, 0, nullptr},          // separator
@@ -539,6 +543,9 @@ void ToolbarUpdateStateForWindow(MainWindow* win, bool setButtonsVisibility) {
             SetToolbarButtonToolTipByIdx(win, i, cmdId, tip);
         }
     }
+
+    SetToolbarButtonCheckedState(win, CmdToggleLibrary, win->uiState.libraryVisible);
+    SetToolbarButtonCheckedState(win, CmdToggleBookmarks, win->uiState.tocVisible);
 
     if (setButtonsVisibility) {
         // drop a separator that would sit next to another, or at either end

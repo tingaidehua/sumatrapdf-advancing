@@ -20,6 +20,8 @@
     <ClInclude Include="..\src\DocProperties.h" />
     <ClInclude Include="..\src\FilterUtil.h" />
     <ClInclude Include="..\src\Flags.h" />
+    <ClInclude Include="..\src\LibraryReadingTracker.h" />
+    <ClInclude Include="..\src\LibraryStore.h" />
     <ClInclude Include="..\src\PageRenderPolicy.h" />
     <ClInclude Include="..\src\PdfDarkMode.h" />
     <ClInclude Include="..\src\RefHoverDetect.h" />
@@ -149,6 +151,8 @@
     <ClCompile Include="..\src\DocProperties.cpp" />
     <ClCompile Include="..\src\FilterUtil.cpp" />
     <ClCompile Include="..\src\Flags.cpp" />
+    <ClCompile Include="..\src\LibraryReadingTracker.cpp" />
+    <ClCompile Include="..\src\LibraryStore.cpp" />
     <ClCompile Include="..\src\PageRenderPolicy.cpp" />
     <ClCompile Include="..\src\PdfDarkModeImageClassifier_ut.cpp" />
     <ClCompile Include="..\src\PdfDarkModeImageRules.cpp" />

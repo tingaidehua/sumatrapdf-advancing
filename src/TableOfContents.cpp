@@ -106,8 +106,9 @@ static void TocCustomizeTooltip(TreeView::GetTooltipEvent* ev) {
 // (crash 8bfe7adb1000001: EngineMupdf::HandleLink / dest->GetKind).
 
 // Own a stable copy of the destination at post time. Engine-private kinds
-// that hold fz_outline/fz_link (mupdf) are converted to scrollTo with
-// page/rect/zoom already resolved on the TocItem/dest.
+// that hold fz_outline/fz_link (mupdf) are converted to scrollTo with the
+// page/rect already resolved on the TocItem/dest. Bookmarks are navigation,
+// not view-mode changes: keep the zoom chosen by the reader.
 static IPageDestination* SnapshotDestForDeferredNav(IPageDestination* dest, int tocPageNo) {
     if (!dest) {
         return nullptr;
@@ -153,7 +154,7 @@ static IPageDestination* SnapshotDestForDeferredNav(IPageDestination* dest, int 
         copy->kind = k;
         copy->pageNo = pageNo;
         copy->rect = PageDestGetRect(dest);
-        copy->zoom = PageDestGetZoom(dest);
+        copy->zoom = 0;
         copy->value = str::Dup(PageDestGetValue(dest));
         copy->name = str::Dup(PageDestGetName(dest));
         return copy;
@@ -173,7 +174,6 @@ static IPageDestination* SnapshotDestForDeferredNav(IPageDestination* dest, int 
         return nullptr;
     }
     RectF r = PageDestGetRect(dest);
-    float zoom = PageDestGetZoom(dest);
     if (k == kindDestinationMupdf) {
         // Prefer resolved anchor; outline x/y can be 0 and scroll to the wrong place
         RectF pt = PageDestGetDestPoint(dest);
@@ -182,9 +182,8 @@ static IPageDestination* SnapshotDestForDeferredNav(IPageDestination* dest, int 
                 r = RectF{pt.x, pt.y, kDestUseDefault, kDestUseDefault};
             }
         }
-        zoom = dest->GetZoom2();
     }
-    return NewSimpleDest(pageNo, r, zoom);
+    return NewSimpleDest(pageNo, r, 0);
 }
 
 #if defined(DEBUG)
@@ -199,7 +198,7 @@ bool TableOfContents_UnitTestSnapshotNamedDest() {
 
     IPageDestination* snapshot = SnapshotDestForDeferredNav(&source, 7);
     bool ok = snapshot && snapshot->GetKind() == kindDestinationScrollTo && PageDestGetPageNo(snapshot) == 1 &&
-              PageDestGetRect(snapshot) == source.rect && PageDestGetZoom(snapshot) == source.zoom &&
+              PageDestGetRect(snapshot) == source.rect && PageDestGetZoom(snapshot) == 0 &&
               str::Eq(PageDestGetValue(snapshot), source.value) && str::Eq(PageDestGetName(snapshot), source.name);
     delete snapshot;
     return ok;

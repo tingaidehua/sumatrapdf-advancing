@@ -82,7 +82,7 @@ export function launchSumatra(args: string[], opts?: { defaultWindowPos?: boolea
 // the test has to read back the settings file.
 export async function launchControlled(
   args: string[],
-  opts?: { defaultWindowPos?: boolean; saveSettings?: boolean },
+  opts?: { defaultWindowPos?: boolean; saveSettings?: boolean; connectTimeoutMs?: number },
 ): Promise<{ proc: Bun.Subprocess; client: ControlClient; frame: number }> {
   const pipe = uniquePipeName();
   const posArgs = opts?.defaultWindowPos || args.includes("-window-pos") ? [] : windowPosArgs();
@@ -92,7 +92,7 @@ export async function launchControlled(
     stderr: "ignore",
   });
   try {
-    const client = await ControlClient.connect(pipe);
+    const client = await ControlClient.connect(pipe, opts?.connectTimeoutMs);
     const frame = await waitForFrame(proc.pid!);
     if (!frame) {
       client.close();

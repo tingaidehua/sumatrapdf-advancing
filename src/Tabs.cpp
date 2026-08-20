@@ -111,6 +111,9 @@ static inline Size GetTabSize(HWND hwnd) {
 
 static void ShowTabBar(MainWindow* win, bool show) {
     if (show == win->tabsVisible) {
+        if (win->tabsCtrl) {
+            win->tabsCtrl->SetIsVisible(show);
+        }
         return;
     }
     win->tabsVisible = show;
@@ -135,7 +138,7 @@ void UpdateTabWidth(MainWindow* win) {
         }
     }
     bool showSingleTab = SettingsUseTabs() || win->tabsInTitlebar;
-    bool showTabs = (nDocTabs > 1) || (showSingleTab && (nDocTabs > 0));
+    bool showTabs = false;
     // TabWidth is stored in logical (96-DPI) units, same as other layout
     // settings; convert to physical pixels so HiDPI monitors honor the value
     // (issue #3850). Height already uses DpiScale via GetTabbarHeight.
@@ -457,22 +460,12 @@ void CloseAllTabs(MainWindow* win) {
 }
 
 // TODO: add "Move to another window" sub-menu
-static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
-    MainWindow* win = FindMainWindowByHwnd(tabsCtrl->hwnd);
-    if (!win) {
+void ShowTabContextMenu(WindowTab* tabUnderMouse, Point pt) {
+    MainWindow* win = FindMainWindowByTab(tabUnderMouse);
+    if (!win || tabUnderMouse->IsAboutTab()) {
         return;
     }
-    TabsCtrl::MouseState tabState = tabsCtrl->TabStateFromMousePosition(ev->ptWindow);
-    int tabIdx = tabState.tabIdx;
-    if (tabIdx < 0) {
-        return;
-    }
-
-    WindowTab* tabUnderMouse = win->Tabs()[tabIdx];
-    if (tabUnderMouse->IsAboutTab()) {
-        return;
-    }
-    Point pt = HwndClientToScreen(tabsCtrl->hwnd, ev->ptWindow);
+    int tabIdx = win->GetTabIdx(tabUnderMouse);
 
     Vec<WindowTab*> toCloseOther;
     Vec<WindowTab*> toCloseRight;
@@ -583,6 +576,20 @@ static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
     }
     // everything we forward to main window
     HwndSendCommand(win->hwndFrame, cmdId);
+}
+
+static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
+    MainWindow* win = FindMainWindowByHwnd(tabsCtrl->hwnd);
+    if (!win) {
+        return;
+    }
+    TabsCtrl::MouseState tabState = tabsCtrl->TabStateFromMousePosition(ev->ptWindow);
+    int tabIdx = tabState.tabIdx;
+    if (tabIdx < 0) {
+        return;
+    }
+    Point pt = HwndClientToScreen(tabsCtrl->hwnd, ev->ptWindow);
+    ShowTabContextMenu(win->Tabs()[tabIdx], pt);
 }
 
 static void MainWindowTabClosed(MainWindow* win, TabsCtrl::ClosedEvent* ev) {
@@ -706,6 +713,36 @@ void SaveCurrentWindowTab(MainWindow* win) {
     win->tabSelectionHistory->Append(tab);
 }
 
+static WindowTab* AddHomeTab(MainWindow* win, bool deferUpdate) {
+    auto* homeTab = new WindowTab(win);
+    homeTab->type = WindowTab::Type::About;
+    homeTab->canvasRc = win->canvasRc;
+    auto* tabInfo = new TabInfo();
+    tabInfo->text = str::Dup(StrL("Home"));
+    tabInfo->tooltip = nullptr;
+    tabInfo->isPinned = true;
+    tabInfo->canClose = true;
+    tabInfo->userData = (UINT_PTR)homeTab;
+    int insertedIdx = win->tabsCtrl->InsertTab(0, tabInfo, !deferUpdate);
+    ReportIf(insertedIdx != 0);
+    return homeTab;
+}
+
+void ShowHomeTab(MainWindow* win) {
+    if (!win || !win->tabsCtrl) {
+        return;
+    }
+    for (WindowTab* tab : win->Tabs()) {
+        if (tab->IsAboutTab()) {
+            SelectTabInWindow(tab);
+            return;
+        }
+    }
+    AddHomeTab(win, false);
+    TabsSelect(win, 0);
+    UpdateTabWidth(win);
+}
+
 WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate) {
     ReportIf(!win);
     if (!win) {
@@ -721,17 +758,7 @@ WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate) {
     bool noHomeTab = gGlobalPrefs->noHomeTab;
     bool createHomeTab = useTabs && !noHomeTab && (idx == 0);
     if (createHomeTab) {
-        WindowTab* homeTab = new WindowTab(win);
-        homeTab->type = WindowTab::Type::About;
-        homeTab->canvasRc = win->canvasRc;
-        TabInfo* newTab = new TabInfo();
-        newTab->text = str::Dup(StrL("Home"));
-        newTab->tooltip = nullptr;
-        newTab->isPinned = true;
-        newTab->canClose = true;
-        newTab->userData = (UINT_PTR)homeTab;
-        int insertedIdx = tabs->InsertTab(idx, newTab, !deferUpdate);
-        ReportIf(insertedIdx != 0);
+        AddHomeTab(win, deferUpdate);
         idx++;
     }
 

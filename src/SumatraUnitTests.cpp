@@ -17,6 +17,7 @@
 #include "GlobalPrefs.h"
 #include "Flags.h"
 #include "Commands.h"
+#include "SidebarLayout.h"
 
 // must be last to over-write assert()
 #include "base/UtAssert.h"
@@ -26,6 +27,8 @@
 #if defined(DEBUG)
 void PageRenderPolicy_UnitTests();
 void CommandPaletteModel_UnitTests();
+void LibraryStore_UnitTests();
+void LibraryReadingTracker_UnitTests();
 #if OS_LINUX
 void FileWatcher_UnitTests();
 #endif
@@ -161,6 +164,22 @@ static void BenchRangeTest() {
     utassert(!IsBenchPagesInfo("1-3,loadonly"));
     utassert(!IsBenchPagesInfo(nullptr));
 }
+
+#if defined(DEBUG)
+static void SidebarLayoutTest() {
+    // With Library at x=201, a cursor at 441 still means a 240px ToC.
+    utassert(SidebarDxFromCursor(Rect{0, 0, 240, 800}, 240, false) == 240);
+    utassert(SidebarDxFromCursor(Rect{201, 0, 240, 800}, 441, false) == 240);
+
+    // RTL measures from the ToC's fixed right edge, not the frame edge.
+    utassert(SidebarDxFromCursor(Rect{500, 0, 240, 800}, 500, true) == 240);
+
+    utassert(ToolbarDyOutsideCaption(true, true, false, 42) == 0);
+    utassert(ToolbarDyOutsideCaption(false, true, false, 42) == 42);
+    utassert(ToolbarDyOutsideCaption(true, true, true, 42) == 42);
+    utassert(ToolbarDyOutsideCaption(true, false, false, 0) == 0);
+}
+#endif
 
 // TODO: disabled because they bring too many dependencies
 static void versioncheck_test() {
@@ -319,6 +338,9 @@ void SumatraPDF_UnitTests() {
     Layout_UnitTests();
     PageRenderPolicy_UnitTests();
     CommandPaletteModel_UnitTests();
+    LibraryStore_UnitTests();
+    LibraryReadingTracker_UnitTests();
+    SidebarLayoutTest();
 #if OS_LINUX
     FileWatcher_UnitTests();
 #endif

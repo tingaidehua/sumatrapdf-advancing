@@ -25,6 +25,7 @@ struct VirtCaptionButton;
 struct DropDown;
 struct Checkbox;
 struct VirtButton;
+struct VirtIconButton;
 struct TabsCtrl;
 struct TocTree;
 struct TocItem;
@@ -230,6 +231,22 @@ struct MainWindow {
     // favorites are showing). 0 = not laid out yet
     int sidebarDx = 0;
 
+    // library sidebar, independent from the bookmarks/favorites column
+    HWND hwndLibraryBox = nullptr;
+    VirtText* libraryLabel = nullptr;
+    VirtIconButton* libraryAddButton = nullptr;
+    VirtRoot* libraryRoot = nullptr;
+    Edit* libraryFilterEdit = nullptr;
+    TreeView* libraryTreeView = nullptr;
+    ILayout* libraryLayout = nullptr;
+    int libraryDx = 0;
+    uintptr_t libraryDragItem = 0;
+    Point libraryDragStart;
+    bool libraryDragging = false;
+    Vec<i64> expandedLibraryCollections;
+    bool libraryExpansionInitialized = false;
+    bool libraryModelFiltered = false;
+
     // state related to favorites
     HWND hwndFavBox = nullptr;
     VirtText* favLabel = nullptr;
@@ -272,6 +289,7 @@ struct MainWindow {
     // the splitters are virtual controls living in the frame's own tree
     // (frameRoot), not child windows
     VirtSplitter* sidebarSplitter = nullptr;
+    VirtSplitter* librarySplitter = nullptr;
 
     // horizontal splitter for resizing favorites and bookmars parts
     VirtSplitter* favSplitter = nullptr;
@@ -390,6 +408,7 @@ struct MainWindow {
     HBox* frameLayout = nullptr;
     HwndSlot* tocSlot = nullptr;
     HwndSlot* favSlot = nullptr;
+    HwndSlot* librarySlot = nullptr;
     // same hwndFavBox as favSlot; shown instead of the canvas when the
     // Favorites tab is selected
     HwndSlot* fullFavSlot = nullptr;
@@ -398,6 +417,7 @@ struct MainWindow {
     HwndSlot* tabsSlot = nullptr;
     HwndSlot* menuSlot = nullptr;
     HwndSlot* toolbarTopSlot = nullptr;
+    HwndSlot* captionToolbarSlot = nullptr;
     HwndSlot* toolbarBottomSlot = nullptr;
     // tabs-in-titlebar caption: VirtCtrl buttons + HwndSlots for tabs/menu
     VBox* captionLayout = nullptr;
@@ -463,6 +483,7 @@ struct MainWindow {
             bool tabsVisible = false;
             bool isToolbarVisible = false;
             bool tocVisible = false;
+            bool libraryVisible = false;
             bool showFavorites = false;
             // full-window Favorites tab vs. sidebar panel: different geometry
             bool favoritesAsTab = false;
@@ -476,6 +497,7 @@ struct MainWindow {
         // desired visibility of the sidebar / AI chat panels; applied
         // (HwndSetVisible) by RelayoutFrame
         bool tocVisible = false;
+        bool libraryVisible = false;
         bool favVisible = false;
         bool aiChatVisible = false;
         bool updatePending = false; // a FrameUpdateUi uitask is queued

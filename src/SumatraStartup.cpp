@@ -67,6 +67,7 @@
 #include "Installer.h"
 #include "RegistryPreview.h"
 #include "ExternalViewers.h"
+#include "Library.h"
 #include "Theme.h"
 #include "DarkMode_win.h"
 #include "CommandPalette.h"
@@ -2143,6 +2144,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     WindowTab* tabToSelect = nullptr;
     Str logFilePath;
     bool logFileBecauseDebug = false;
+    bool logFileBecauseDefault = false;
 
     supressThrowFromNew();
 
@@ -2241,11 +2243,20 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     // (default policy is to disallow everything)
     InitializePolicies(flags.restrictedUse);
 
+    bool defaultViewerLog = !gIsDebugBuild && !isTool && !noLogHere && !gForTesting && !flags.log &&
+                            !flags.hwndPluginParent && !flags.stressTestPath;
+    if (defaultViewerLog) {
+        TempStr path = GetPathInAppDataDirTemp(StrL("SumatraPDF.log"));
+        flags.logFile = str::Dup(GetPermArena(), path);
+        flags.log = true;
+        logFileBecauseDefault = true;
+    }
+
     // in debug build, default
     if (gIsDebugBuild) {
         if (!flags.logFile) {
             // from the perm arena like all other flag strings (~Flags frees nothing)
-            TempStr dir = GetPathInExeDirTemp(StrL("sumlog.txt"));
+            TempStr dir = GetPathInAppDataDirTemp(StrL("sumlog.txt"));
             flags.logFile = str::Dup(GetPermArena(), dir);
             flags.log = true;
             logFileBecauseDebug = true;
@@ -2469,6 +2480,14 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     // TODO: for reasons I don't understand, this must be called before LoadSettings()
     DarkModeInit();
 
+    // This build is distributed as a relocatable portable pair: the EXE and a
+    // same-name data directory beside it. Establish that root before settings,
+    // logging, WebView and Library initialization can choose a path.
+    if (!flags.appdataDir) {
+        TempStr exeBase = path::GetBaseNameTemp(GetSelfExePathTemp());
+        SetAppDataDir(path::JoinTemp(GetSelfExeDirTemp(), path::GetPathNoExtTemp(exeBase)));
+    }
+
     LoadSettings();
     UpdateGlobalPrefs(flags);
     if (gMyWindowWasEmbedded) {
@@ -2624,6 +2643,8 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     }
 
 ContinueOpenWindow:
+    LibraryInitialize();
+
     // keep this data alive until the end of program and ensure it's not
     // over-written by re-loading settings file while we're using it
     // and also to keep TabState forever for lazy loading of tabs
@@ -2851,6 +2872,7 @@ ContinueOpenWindow:
 
 Exit:
     // logf("Exiting with exit code: %d\n", exitCode);
+    LibraryShutdown();
     UnregisterSettingsForFileChanges();
 
     HandleRedirectedConsoleOnShutdown();
@@ -2862,7 +2884,7 @@ Exit:
     // don't shell-open the log for -for-testing automation runs: it spawns a
     // stray editor window per run (and, depending on the .txt association,
     // could even launch another non-testing SumatraPDF that saves settings)
-    if (!logFileBecauseDebug && !gForTesting) {
+    if (!logFileBecauseDebug && !logFileBecauseDefault && !gForTesting) {
         LaunchFileIfExists(logFilePath);
     }
     str::FreePtr(&logFilePath);

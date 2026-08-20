@@ -301,6 +301,8 @@ static SeqStrings gCommandNames =
     "CmdToggleHighlightFormFields\0"
     "CmdTogglePageBoxes\0"
     "CmdConvertPdfToImages\0"
+    "CmdShowHome\0"
+    "CmdToggleLibrary\0"
     "CmdNone\0"
     "\0";
 
@@ -590,6 +592,8 @@ static i32 gCommandIds[] = {
     CmdToggleHighlightFormFields,
     CmdTogglePageBoxes,
     CmdConvertPdfToImages,
+    CmdShowHome,
+    CmdToggleLibrary,
     CmdNone,
 };
 
@@ -879,6 +883,8 @@ SeqStrings gCommandDescriptions =
     "Toggle Highlight Form Fields\0"
     "Toggle Page Boxes\0"
     "Convert PDF to Images...\0"
+    "Show Home\0"
+    "Toggle Library\0"
     "Do nothing\0"
     "\0";
 // clang-format on

@@ -1,6 +1,8 @@
 /**
  * Packs translations, JS runtimes, and the in-app manual into one LzSA archive
- * (.work/embedded.dat) embedded as IDR_EMBEDDED_PAK.
+ * (.work/embedded.dat) embedded as IDR_EMBEDDED_PAK. The translation source
+ * is versioned under resources/ so a clean checkout never silently produces
+ * an English-only binary.
  *
  * Contents (in-archive names):
  *   translations.txt
@@ -10,13 +12,13 @@
  *
  * Usage: bun cmd/pack-embedded.ts
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 const workDir = ".work";
 const stagingDir = join(workDir, "embedded-src");
 const archivePath = join(workDir, "embedded.dat");
-const translationsTxt = join(workDir, "translations.txt");
+const translationsTxt = join("resources", "translations.txt");
 const docsDir = join(workDir, "docs");
 const makeLzsaExe = resolve(join("bin", "MakeLZSA.exe"));
 
@@ -50,8 +52,7 @@ export async function packEmbedded(): Promise<void> {
   }
   mkdirSync(workDir, { recursive: true });
   if (!existsSync(translationsTxt)) {
-    writeFileSync(translationsTxt, "");
-    console.log(`created empty ${translationsTxt}`);
+    throw new Error(`missing ${translationsTxt}; add the versioned translation resource before packing`);
   }
   for (const p of ["ext/marked.min.js", "ext/mermaid.min.js"]) {
     if (!existsSync(p)) {

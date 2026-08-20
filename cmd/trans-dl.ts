@@ -1,8 +1,8 @@
 /**
  * Maintain SumatraPDF translations with apptranslator as the source of truth.
  *
- * Local cache (gitignored via .work/):
- *   .work/translations.txt       languages complete enough for the binary
+ * Versioned resource:
+ *   resources/translations.txt   languages complete enough for the binary
  *   (packed into .work/embedded.dat with marked/mermaid/manual via pack-embedded.ts)
  *
  * Flow:
@@ -43,7 +43,7 @@ const LOCAL_SERVER = "http://127.0.0.1:9311";
 const APP_NAME = "SumatraPDF";
 
 const workDir = ".work";
-const translationsTxtPath = join(workDir, "translations.txt");
+const translationsTxtPath = join("resources", "translations.txt");
 // legacy path kept only for cleanup messaging; packing is pack-embedded.ts
 
 const translationPattern = /\b_TR[ANW]?\("(.*?)"\)/g;
@@ -218,9 +218,7 @@ function tryGetTransSecret(): string {
 
 /** Minimal empty cache when we cannot talk to apptranslator (no secret). */
 function writeEmptyTranslations(): void {
-  mkdirSync(workDir, { recursive: true });
-  writeFileSync(translationsTxtPath, "", "utf-8");
-  console.log(`Wrote empty ${translationsTxtPath} (translations skipped)`);
+  throw new Error(`translation download unavailable; refusing to overwrite versioned ${translationsTxtPath}`);
 }
 
 interface DownloadResult {
@@ -1206,7 +1204,7 @@ function writeTranslationsForBinary(pt: ParsedTranslations, downloadSha1: string
     }
   }
 
-  mkdirSync(workDir, { recursive: true });
+  mkdirSync("resources", { recursive: true });
   const content = out.join("\n") + "\n";
   writeFileSync(translationsTxtPath, content, "utf-8");
   console.log(`Wrote ${translationsTxtPath} of size ${content.length}`);

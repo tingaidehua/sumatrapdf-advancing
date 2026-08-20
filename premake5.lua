@@ -681,6 +681,18 @@ workspace "SumatraPDF"
     disablewarnings { "4005", "4131", "4244", "4245", "4267", "4996" }
     zlib_files()
 
+  project "a-sqlite"
+    static_intermediate_dirs()
+    kind "StaticLib"
+    language "C"
+    mixed_dbg_rel_conf()
+    defines {
+      "SQLITE_THREADSAFE=1", "SQLITE_DEFAULT_MEMSTATUS=0", "SQLITE_OMIT_DEPRECATED",
+      "SQLITE_OMIT_LOAD_EXTENSION", "SQLITE_USE_URI=0"
+    }
+    disablewarnings { "4100", "4127", "4242", "4244", "4267", "4701", "4706", "4996" }
+    sqlite_files()
+
   -- Used by mupdf (linked) and by bench_image.
   project "libjpeg-turbo"
     static_intermediate_dirs()
@@ -1088,10 +1100,10 @@ workspace "SumatraPDF"
     mixed_dbg_rel_conf()
     disablewarnings { "4838" }
     defines { "SUMATRA_TEST_UTIL=1" }
-    includedirs { "src" }
+    includedirs { "src", "ext/a-sqlite" }
     test_util_files()
     setup_base_pch()
-    links { "gdiplus", "comctl32", "shlwapi", "Version", "wininet", "shcore", "wintrust", "crypt32" }
+    links { "a-sqlite", "gdiplus", "comctl32", "shlwapi", "Version", "wininet", "shcore", "wintrust", "crypt32" }
 
   project "test_engines"
     static_app_objdir()
@@ -1317,7 +1329,7 @@ workspace "SumatraPDF"
     entrypoint "WinMainCRTStartup"
     manifest("Off")
     defines { "LIBARCHIVE_STATIC" }
-    includedirs { "src", "ext/mupdf/include" }
+    includedirs { "src", "ext/mupdf/include", "ext/a-sqlite" }
     includedirs { "ext/synctex", "ext/djvudec", "ext/chmdec", "ext/libarchive", "ext/a-zopfli", "ext/msdes" }
     includedirs { "ext/cmark-gfm/src", "ext/cmark-gfm/extensions", "ext/mupdf/scripts/cmark-gfm" }
     includedirs { "ext/heicdec", "ext/libwebp/src", "ext/jxldec" }
@@ -1382,7 +1394,7 @@ workspace "SumatraPDF"
     -- (freetype) + needed by heic.
     links {
       "djvudec", "libwebp", "dav1d", "heicdec", "jxldec", "brotli",
-      "mupdf", "libarchive", "base", "unrar", "chmdec", "a-zopfli", "msdes"
+      "mupdf", "libarchive", "base", "unrar", "chmdec", "a-zopfli", "a-sqlite", "msdes"
     }
     links {
       "comctl32", "delayimp", "gdiplus", "msimg32", "shlwapi", "urlmon",
@@ -1420,7 +1432,7 @@ workspace "SumatraPDF"
     entrypoint "WinMainCRTStartup"
     manifest("Off")
     defines { "LIBARCHIVE_STATIC" }
-    includedirs { "src", "ext/mupdf/include" }
+    includedirs { "src", "ext/mupdf/include", "ext/a-sqlite" }
     includedirs { "ext/synctex", "ext/djvudec", "ext/chmdec", "ext/libarchive", "ext/a-zopfli", "ext/msdes" }
     includedirs { "ext/darkmodelib/include" }
     -- headers only: webp/jxl/heic/chm/DES symbols come from libsumatrapdf.dll (libsumatrapdf.def)
@@ -1491,7 +1503,7 @@ workspace "SumatraPDF"
     defines { "CMARK_GFM_STATIC_DEFINE" }
 
     links {
-      "libsumatrapdf", "base", "a-zopfli"
+      "libsumatrapdf", "base", "a-zopfli", "a-sqlite"
     }
     links {
       "comctl32", "delayimp", "gdiplus", "msimg32", "shlwapi", "urlmon",

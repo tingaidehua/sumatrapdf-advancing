@@ -144,6 +144,13 @@ SearchUIFloating = false
 ; if true, show the Favorites sidebar
 ShowFavorites = false
 
+; if true, show the Library sidebar (introduced in version 3.7)
+ShowLibrary = true
+
+; width of the Library sidebar in screen pixels at 96 DPI; values below 160 use
+; the default (introduced in version 3.7)
+LibraryDx = 280
+
 ; if true, favorites within each file are sorted alphabetically by name (or page
 ; label); if false (the default), they are sorted by page number (introduced in
 ; version 3.7)
@@ -229,11 +236,11 @@ ScrollLineAmount = 16
 ; 3.7)
 PaddingAfterLastPage = false
 
-; if true, going to a destination (clicking a bookmark or a link inside the
-; document) keeps the current zoom instead of applying the zoom the destination
-; asks for; it still goes to the page and the position. Same as Adobe Reader's
-; 'forbid the change of the current zoom factor during execution of Go to
-; Destination actions' (introduced in version 3.7)
+; bookmarks always keep the reader's current zoom. If true, destination links
+; inside the document also keep the current zoom instead of applying the zoom
+; the destination asks for; links still go to the target page and position. Same
+; as Adobe Reader's 'forbid the change of the current zoom factor during
+; execution of Go to Destination actions' (introduced in version 3.7)
 IgnoreDestinationZoom = false
 
 ; if true, following an internal link or bookmark flashes a highlight at the

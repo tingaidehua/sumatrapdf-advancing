@@ -10,11 +10,14 @@ set CMDDIR=%~dp0
 set ROOT=%CMDDIR:~0,-1%\..
 
 if not exist "%ROOT%\.work" mkdir "%ROOT%\.work"
-if not exist "%ROOT%\.work\translations.txt" type nul > "%ROOT%\.work\translations.txt"
+if not exist "%ROOT%\resources\translations.txt" (
+  echo resources\translations.txt missing
+  exit /b 1
+)
 
 if not exist "%ROOT%\.work\embedded-src\translations.txt" (
   if not exist "%ROOT%\.work\embedded-src" mkdir "%ROOT%\.work\embedded-src"
-  copy /y "%ROOT%\.work\translations.txt" "%ROOT%\.work\embedded-src\translations.txt" >nul
+  copy /y "%ROOT%\resources\translations.txt" "%ROOT%\.work\embedded-src\translations.txt" >nul
   copy /y "%ROOT%\ext\marked.min.js" "%ROOT%\.work\embedded-src\marked.min.js" >nul
   copy /y "%ROOT%\ext\mermaid.min.js" "%ROOT%\.work\embedded-src\mermaid.min.js" >nul
 )
