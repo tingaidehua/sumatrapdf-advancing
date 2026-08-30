@@ -188,8 +188,7 @@ bool gRedrawLog = false;
 Func1<MainWindow*> gAfterLayout;
 
 // returns false when the relayout was skipped (nothing layout-affecting changed)
-static bool RelayoutFrame(MainWindow* win, bool updateToolbars = true, int sidebarDx = -1,
-                          bool isSplitterDrag = false);
+static bool RelayoutFrame(MainWindow* win, bool updateToolbars = true, int sidebarDx = -1, bool isSplitterDrag = false);
 static void UpdateOverlayScrollbarPositions(MainWindow* win);
 
 static Str HwndName(HWND hwnd) {
@@ -4628,7 +4627,7 @@ void LoadModelIntoTab(WindowTab* tab) {
         }
         OnAIChatTabChanged(win);
         LibraryUpdateReadingActivity();
-        RefreshLibraryPanels();
+        SyncLibrarySelection(win);
     }
 }
 

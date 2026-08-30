@@ -8,4 +8,5 @@ void LayoutLibraryPanel(MainWindow* win);
 void UpdateLibraryPanelText(MainWindow* win);
 void RefreshLibraryPanel(MainWindow* win);
 void RefreshLibraryPanels();
+void SyncLibrarySelection(MainWindow* win);
 void SetLibraryPanelVisible(MainWindow* win, bool visible);

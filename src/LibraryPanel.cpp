@@ -180,6 +180,60 @@ static void RememberExpandedCollections(MainWindow* win) {
     win->libraryExpansionInitialized = true;
 }
 
+static bool LibraryPathsEqual(Str a, Str b) {
+    if (!a || !b) {
+        return false;
+    }
+    return str::EqI(path::NormalizeTemp(a), path::NormalizeTemp(b));
+}
+
+static LibraryTreeItem* FindBookByPath(LibraryTreeItem* item, Str path) {
+    if (!item || !path) {
+        return nullptr;
+    }
+    if (item->kind == LibraryTreeKind::Book && LibraryPathsEqual(item->path, path)) {
+        return item;
+    }
+    for (LibraryTreeItem* child : item->children) {
+        LibraryTreeItem* found = FindBookByPath(child, path);
+        if (found) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+static Str CurrentPdfPath(MainWindow* win) {
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    if (!IsPdfTab(tab)) {
+        return Str();
+    }
+    return tab->filePath;
+}
+
+// TreeView selection is the "currently viewed book" highlight. Rebuilds and
+// tab switches must restore it from the current tab path; otherwise Windows
+// leaves no selection or keeps the first inserted row blue.
+void SyncLibrarySelection(MainWindow* win) {
+    if (!win || !win->libraryTreeView || !win->libraryTreeView->treeModel) {
+        return;
+    }
+    auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
+    LibraryTreeItem* book = FindBookByPath(model->root, CurrentPdfPath(win));
+    TreeItem want = book ? (TreeItem)book : TreeModel::kNullItem;
+    if (win->libraryTreeView->GetSelection() == want) {
+        return;
+    }
+    win->libraryTreeView->SelectItem(want);
+    if (!book) {
+        return;
+    }
+    HTREEITEM hi = win->libraryTreeView->GetHandleByTreeItem((TreeItem)book);
+    if (hi) {
+        TreeView_EnsureVisible(win->libraryTreeView->hwnd, hi);
+    }
+}
+
 void RefreshLibraryPanel(MainWindow* win) {
     if (!win || !win->libraryTreeView) return;
     if (win->libraryDragging) ReleaseCapture();
@@ -192,6 +246,7 @@ void RefreshLibraryPanel(MainWindow* win) {
     win->libraryModelFiltered = !!filter;
     win->libraryExpansionInitialized = true;
     delete previous;
+    SyncLibrarySelection(win);
 }
 
 void RefreshLibraryPanels() {
@@ -209,6 +264,9 @@ static void OpenLibraryItem(MainWindow* source, LibraryTreeItem* item) {
     MainWindow* existing = FindMainWindowByFile(item->path, true);
     if (existing) {
         existing->Focus();
+        if (existing != source) {
+            SyncLibrarySelection(source);
+        }
         return;
     }
     LoadArgs args(item->path, source);
