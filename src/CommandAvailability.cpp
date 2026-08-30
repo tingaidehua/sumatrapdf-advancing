@@ -738,7 +738,10 @@ CommandVisibility GetCommandVisibility(int cmdId, const AppCommandCtx& ctx, Comm
         return CommandVisibility::Hide;
     }
     if ((cmdId == CmdToggleBookmarks) || (cmdId == CmdToggleTableOfContents)) {
-        return ctx.hasToc ? CommandVisibility::Show : CommandVisibility::Hide;
+        // Always keep the toolbar button. Hiding it when a PDF has no outline
+        // shifted every button to its right (and hid the control on files
+        // such as ones without a ToC).
+        return CommandVisibility::Show;
     }
 
     // No extractable text on comics, image folders, or single images.

@@ -641,8 +641,7 @@ static void UpdateDocTocExpansionStateRecur(TreeView* treeView, Vec<int>& tocSta
 }
 
 void UpdateTocExpansionState(Vec<int>& tocState, TreeView* treeView, TocTree* docTree) {
-    if (treeView->treeModel != docTree) {
-        // CrashMe();
+    if (!docTree || !treeView || treeView->treeModel != docTree || !docTree->root) {
         return;
     }
     tocState.Reset();

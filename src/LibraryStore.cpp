@@ -239,7 +239,10 @@ Str LibraryStoreError(LibraryStore* store) {
     return store ? store->error : Str();
 }
 
-LibraryBook* LibraryStoreRecordOpen(LibraryStore* store, Str path, Str title, i64 nowMs) {
+LibraryBook* LibraryStoreRecordOpen(LibraryStore* store, Str path, Str title, i64 nowMs, bool* placedAtRoot) {
+    if (placedAtRoot) {
+        *placedAtRoot = false;
+    }
     if (!LibraryStoreIsOpen(store) || !path) {
         return nullptr;
     }
@@ -309,6 +312,8 @@ RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
                 SetError(store, StrL("place opened book at library root"));
                 DeleteLibraryBook(book);
                 book = nullptr;
+            } else if (placedAtRoot) {
+                *placedAtRoot = sqlite3_changes(store->db) > 0;
             }
             sqlite3_finalize(stmt);
         } else {
@@ -558,21 +563,29 @@ Vec<LibraryCollection*> LibraryStoreGetCollections(LibraryStore* store) {
     return collections;
 }
 
+static int CollectionKind(LibraryStore* store, i64 id) {
+    if (!store || id <= 0) {
+        return 0;
+    }
+    sqlite3_stmt* stmt = Prepare(store, "SELECT kind FROM collections WHERE id=?1");
+    if (!stmt) {
+        return 0;
+    }
+    sqlite3_bind_int64(stmt, 1, id);
+    int kind = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        kind = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return kind;
+}
+
 LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentId, bool isShelf, Str name) {
     if (!LibraryStoreIsOpen(store) || !name || (isShelf && parentId != 0) || (!isShelf && parentId == 0)) {
         return nullptr;
     }
-    if (!isShelf) {
-        sqlite3_stmt* check = Prepare(store, "SELECT 1 FROM collections WHERE id=?1");
-        if (!check) {
-            return nullptr;
-        }
-        sqlite3_bind_int64(check, 1, parentId);
-        bool found = sqlite3_step(check) == SQLITE_ROW;
-        sqlite3_finalize(check);
-        if (!found) {
-            return nullptr;
-        }
+    if (!isShelf && CollectionKind(store, parentId) != 1) {
+        return nullptr;
     }
     sqlite3_stmt* stmt =
         Prepare(store, "INSERT INTO collections(parent_id,kind,name,created_ms) VALUES(?1,?2,?3,?4) RETURNING id");
@@ -656,6 +669,14 @@ bool LibraryStoreRenameCollection(LibraryStore* store, i64 collectionId, Str nam
 
 bool LibraryStoreMoveCollection(LibraryStore* store, i64 collectionId, i64 newParentId) {
     if (!LibraryStoreIsOpen(store) || collectionId <= 0 || collectionId == newParentId) {
+        return false;
+    }
+    int sourceKind = CollectionKind(store, collectionId);
+    if (newParentId == 0) {
+        if (sourceKind != 1) {
+            return false;
+        }
+    } else if (sourceKind != 2 || CollectionKind(store, newParentId) != 1) {
         return false;
     }
     sqlite3_stmt* check = Prepare(store, R"sql(
@@ -1025,19 +1046,20 @@ void LibraryStore_UnitTests() {
     manualRoot = LibraryStoreGetBooks(store, LibraryBookScope::ManualRoot, 0, LibrarySort::Title, Str());
     utassert(len(manualRoot) == 2 && manualRoot[0]->id == imported->id && manualRoot[1]->id == b->id);
     DeleteLibraryBooks(manualRoot);
-    LibraryCollection* nested = LibraryStoreCreateCollection(store, category->id, false, StrL("Nested"));
-    utassert(nested);
+    utassert(!LibraryStoreCreateCollection(store, category->id, false, StrL("Nested")));
+    LibraryCollection* other = LibraryStoreCreateCollection(store, shelf->id, false, StrL("Other"));
+    utassert(other);
     // Ctrl-drag copies. A later normal drag to the same destination removes
     // only the source membership and keeps the existing destination.
-    utassert(LibraryStorePlaceBook(store, a->id, category->id, nested->id, true));
-    utassert(LibraryStorePlaceBook(store, a->id, category->id, nested->id, false));
+    utassert(LibraryStorePlaceBook(store, a->id, category->id, other->id, true));
+    utassert(LibraryStorePlaceBook(store, a->id, category->id, other->id, false));
     Vec<LibraryBook*> categoryBooks =
         LibraryStoreGetBooks(store, LibraryBookScope::Collection, category->id, LibrarySort::Title, Str());
-    Vec<LibraryBook*> nestedBooks =
-        LibraryStoreGetBooks(store, LibraryBookScope::Collection, nested->id, LibrarySort::Title, Str());
-    utassert(len(categoryBooks) == 0 && len(nestedBooks) == 1 && nestedBooks[0]->id == a->id);
+    Vec<LibraryBook*> otherBooks =
+        LibraryStoreGetBooks(store, LibraryBookScope::Collection, other->id, LibrarySort::Title, Str());
+    utassert(len(categoryBooks) == 0 && len(otherBooks) == 1 && otherBooks[0]->id == a->id);
     DeleteLibraryBooks(categoryBooks);
-    DeleteLibraryBooks(nestedBooks);
+    DeleteLibraryBooks(otherBooks);
     // Copy and then move a root book proves that root is a real membership,
     // not a derived "unclassified" view.
     utassert(LibraryStorePlaceBook(store, b->id, 0, category->id, true));
@@ -1048,8 +1070,15 @@ void LibraryStore_UnitTests() {
     manualRoot = LibraryStoreGetBooks(store, LibraryBookScope::ManualRoot, 0, LibrarySort::Title, Str());
     utassert(len(manualRoot) == 1 && manualRoot[0]->id == imported->id);
     DeleteLibraryBooks(manualRoot);
-    utassert(!LibraryStoreMoveCollection(store, shelf->id, nested->id));
-    utassert(LibraryStoreMoveCollection(store, nested->id, shelf->id));
+    LibraryCollection* shelf2 = LibraryStoreCreateCollection(store, 0, true, StrL("More"));
+    utassert(shelf2);
+    utassert(!LibraryStoreMoveCollection(store, shelf->id, other->id));
+    utassert(!LibraryStoreMoveCollection(store, other->id, category->id));
+    utassert(!LibraryStoreMoveCollection(store, category->id, 0));
+    utassert(LibraryStoreMoveCollection(store, other->id, shelf2->id));
+    utassert(LibraryStoreMoveCollection(store, other->id, shelf->id));
+    utassert(LibraryStoreDeleteCollection(store, shelf2->id));
+    DeleteLibraryCollection(shelf2);
     utassert(LibraryStoreSetBookOnDesk(store, a->id, true));
     Vec<LibraryBook*> all = LibraryStoreGetBooks(store, LibraryBookScope::All, 0, LibrarySort::OpenCount, Str());
     utassert(len(all) == 4 && str::EqI(all[0]->path, StrL("C:\\Books\\Legacy.pdf")));
@@ -1076,7 +1105,7 @@ void LibraryStore_UnitTests() {
              manualRoot[2]->id == b->id);
     DeleteLibraryBooks(manualRoot);
     DeleteLibraryCollection(category);
-    DeleteLibraryCollection(nested);
+    DeleteLibraryCollection(other);
     DeleteLibraryCollection(shelf);
     DeleteLibraryBook(a);
     DeleteLibraryBook(b);

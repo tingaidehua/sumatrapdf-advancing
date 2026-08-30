@@ -47,7 +47,7 @@ void LibraryStoreClose(LibraryStore* store);
 bool LibraryStoreIsOpen(LibraryStore* store);
 Str LibraryStoreError(LibraryStore* store);
 
-LibraryBook* LibraryStoreRecordOpen(LibraryStore* store, Str path, Str title, i64 nowMs);
+LibraryBook* LibraryStoreRecordOpen(LibraryStore* store, Str path, Str title, i64 nowMs, bool* placedAtRoot = nullptr);
 LibraryBook* LibraryStoreAddBook(LibraryStore* store, Str path, Str title, i64 nowMs);
 LibraryBook* LibraryStoreImportBook(LibraryStore* store, Str path, Str title, i64 openCount, i64 nowMs);
 bool LibraryStoreAddReadingTime(LibraryStore* store, Str path, i64 seconds, i64 nowMs);
@@ -61,8 +61,7 @@ bool LibraryStoreMoveCollection(LibraryStore* store, i64 collectionId, i64 newPa
 bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collectionId);
 // Collection id 0 denotes the visible Library root. A move removes the source
 // membership; a copy preserves it and adds the destination membership.
-bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollectionId, i64 targetCollectionId,
-                           bool copy);
+bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollectionId, i64 targetCollectionId, bool copy);
 bool LibraryStoreSetBookOnDesk(LibraryStore* store, i64 bookId, bool onDesk);
 bool LibraryStoreRemoveBook(LibraryStore* store, i64 bookId);
 

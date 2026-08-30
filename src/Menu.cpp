@@ -1856,7 +1856,7 @@ static void MenuUpdateStateForWindow(MainWindow* win) {
 
     MenuUpdatePrintItem(win, win->menu);
 
-    bool enabled = win->IsDocLoaded() && tab && tab->ctrl->HasToc();
+    bool enabled = win->IsDocLoaded() && tab && tab->ctrl;
     MenuSetEnabled(win->menu, CmdToggleBookmarks, enabled);
 
     bool documentSpecific = win->IsDocLoaded();
@@ -2160,7 +2160,7 @@ void OnWindowContextMenu(MainWindow* win, int x, int y) {
     SetMenuStateForSelection(tab, popup);
 
     MenuUpdatePrintItem(win, popup, true);
-    MenuSetEnabled(popup, CmdToggleBookmarks, win->ctrl->HasToc());
+    MenuSetEnabled(popup, CmdToggleBookmarks, win->IsDocLoaded());
     MenuSetChecked(popup, CmdToggleBookmarks, win->uiState.tocVisible);
 
     MenuSetEnabled(popup, CmdFavoriteToggle, HasFavorites());

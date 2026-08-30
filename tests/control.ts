@@ -66,6 +66,7 @@ export enum ControlCommand {
   TestConvertToImages = 69,
   TestLayout = 70,
   TestDpi = 71,
+  TestLibrary = 72,
 }
 
 export type ControlArg = number | string | Uint8Array | ControlArg[];
@@ -476,6 +477,14 @@ export class ControlClient {
   // Notifications are drawn over the document and linger for ~2s, so a test
   // that reads pixels would have to wait them out. Turning them off also takes
   // down any that are already showing.
+  async library(action: string, ...args: ControlArg[]): Promise<{ code: number; raw: string }> {
+    const res = await this.request(ControlCommand.TestLibrary, [action, ...args]);
+    return {
+      code: typeof res[0] === "number" ? res[0] : -1,
+      raw: String(res[1] ?? "").trim(),
+    };
+  }
+
   async setNotificationsEnabled(enabled: boolean): Promise<void> {
     const res = await this.request(ControlCommand.SetNotificationsEnabled, [enabled ? 1 : 0]);
     const code = typeof res[0] === "number" ? res[0] : -1;

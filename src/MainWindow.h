@@ -241,6 +241,7 @@ struct MainWindow {
     ILayout* libraryLayout = nullptr;
     int libraryDx = 0;
     uintptr_t libraryDragItem = 0;
+    uintptr_t libraryDropItem = 0;
     Point libraryDragStart;
     bool libraryDragging = false;
     Vec<i64> expandedLibraryCollections;

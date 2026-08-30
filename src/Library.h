@@ -10,5 +10,5 @@ bool LibraryIsAvailable();
 Str LibraryGetError();
 LibraryStore* LibraryGetStore();
 
-bool LibraryRecordOpenedDocument(Str path, Str title);
+bool LibraryRecordOpenedDocument(Str path, Str title, bool* treeChanged = nullptr);
 void LibraryUpdateReadingActivity();

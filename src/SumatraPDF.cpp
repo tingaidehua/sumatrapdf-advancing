@@ -3778,8 +3778,12 @@ MainWindow* LoadDocumentFinish(LoadArgs* args) {
     if (!lazyLoad) {
         LibraryUpdateReadingActivity();
         Str libraryTitle = currTab->displayName ? Str(currTab->displayName) : path::GetBaseNameTemp(path);
-        if (LibraryRecordOpenedDocument(path, libraryTitle)) {
+        bool libraryTreeChanged = false;
+        LibraryRecordOpenedDocument(path, libraryTitle, &libraryTreeChanged);
+        if (libraryTreeChanged) {
             RefreshLibraryPanels();
+        } else {
+            SyncLibrarySelection(win);
         }
     }
 
@@ -4453,6 +4457,10 @@ void LoadModelIntoTab(WindowTab* tab) {
         return;
     }
 
+    ULONGLONG switchStart = GetTickCount64();
+    logf("LoadModelIntoTab: begin path='%s' libraryVis=%d showToc=%d\n", tab->filePath ? tab->filePath : StrL(""),
+         tab->win ? (tab->win->uiState.libraryVisible ? 1 : 0) : 0, tab->showToc ? 1 : 0);
+
     LibraryUpdateReadingActivity();
 
     MainWindow* win = tab->win;
@@ -4551,6 +4559,9 @@ void LoadModelIntoTab(WindowTab* tab) {
     if (win->InPresentation()) {
         SetSidebarVisibility(win, tab->showTocPresentation, gGlobalPrefs->showFavorites);
     } else {
+        // Pane visibility for an empty bookmarks column is decided inside
+        // SetSidebarVisibility. Do not OR libraryVisible here: that forced
+        // LoadTocTree/GetToc on every PDF switch and froze the UI thread.
         SetSidebarVisibility(win, tab->showToc, gGlobalPrefs->showFavorites);
     }
 
@@ -4628,6 +4639,9 @@ void LoadModelIntoTab(WindowTab* tab) {
         OnAIChatTabChanged(win);
         LibraryUpdateReadingActivity();
         SyncLibrarySelection(win);
+        logf("LoadModelIntoTab: end path='%s' tocVis=%d libraryDx=%d sidebarDx=%d elapsedMs=%llu\n",
+             tab->filePath ? tab->filePath : StrL(""), win->uiState.tocVisible ? 1 : 0, win->libraryDx, win->sidebarDx,
+             GetTickCount64() - switchStart);
     }
 }
 
@@ -8938,20 +8952,38 @@ static void OnFavSplitterMove(VirtSplitter::MoveEvent* ev) {
 // deferred update, which shows/hides the sidebar windows and relayouts
 // (see FrameUpdateUi).
 void SetSidebarVisibility(MainWindow* win, bool tocVisible, bool showFavorites) {
+    static int sDepth = 0;
+    if (sDepth > 0) {
+        logf("SetSidebarVisibility: reentered depth=%d, skip\n", sDepth);
+        return;
+    }
+    sDepth++;
+
     if (gPluginMode || !CanAccessDisk()) {
         showFavorites = false;
     }
 
-    if (!win->IsDocLoaded() || !win->ctrl || !win->ctrl->HasToc()) {
-        tocVisible = false;
-    }
+    bool userWantsToc = tocVisible;
+    bool hasDoc = win->IsDocLoaded() && win->ctrl;
 
     if (PM_BLACK_SCREEN == win->presentation || PM_WHITE_SCREEN == win->presentation) {
         tocVisible = false;
         showFavorites = false;
+    } else if (!hasDoc) {
+        tocVisible = false;
+    } else {
+        // Honor the per-PDF close state (tab->showToc). An empty pane is fine
+        // when the document has no outline; do not call HasToc just to hide it.
+        tocVisible = userWantsToc;
     }
 
-    if (tocVisible) {
+    bool loadToc = tocVisible && hasDoc && win->ctrl->HasToc();
+    Str path = win->CurrentTab() && win->CurrentTab()->filePath ? win->CurrentTab()->filePath : StrL("");
+    ULONGLONG t0 = GetTickCount64();
+    logf("SetSidebarVisibility: userToc=%d pane=%d loadToc=%d libraryVis=%d path='%s'\n", userWantsToc ? 1 : 0,
+         tocVisible ? 1 : 0, loadToc ? 1 : 0, win->uiState.libraryVisible ? 1 : 0, path);
+
+    if (loadToc) {
         LoadTocTree(win);
         ReportIf(!win->tocLoaded);
     }
@@ -8963,10 +8995,12 @@ void SetSidebarVisibility(MainWindow* win, bool tocVisible, bool showFavorites) 
     if (!win->CurrentTab()) {
         ReportIf(tocVisible);
     } else if (!win->presentation) {
-        win->CurrentTab()->showToc = tocVisible;
+        win->CurrentTab()->showToc = userWantsToc && hasDoc;
     } else if (PM_ENABLED == win->presentation) {
         win->CurrentTab()->showTocPresentation = tocVisible;
     }
+
+    logf("SetSidebarVisibility: done elapsedMs=%llu tocLoaded=%d\n", GetTickCount64() - t0, win->tocLoaded ? 1 : 0);
 
     // TODO: make this a per-window setting as well?
     gGlobalPrefs->showFavorites = showFavorites;
@@ -8982,6 +9016,7 @@ void SetSidebarVisibility(MainWindow* win, bool tocVisible, bool showFavorites) 
     win->uiState.tocVisible = tocVisible;
     win->uiState.favVisible = showFavorites;
     ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars | kUiSidebarDirty);
+    sDepth--;
 }
 
 constexpr const char* kUserLangStr = "${userlang}";
@@ -12343,7 +12378,11 @@ static LRESULT CustomCaptionFrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             // use a larger hit-test area than the visible border for easier resizing
             if (!IsZoomed(hwnd) && !win->isFullScreen && !win->presentation) {
                 int b = kFrameResizeHitTest;
-                bool onLeft = (x - wrc.x) < b;
+                int bLeft = b;
+                if (win->uiState.libraryVisible) {
+                    bLeft = std::max(b, DpiScale(kLibraryLeftGutterDip));
+                }
+                bool onLeft = (x - wrc.x) < bLeft;
                 bool onRight = (wrc.x + wrc.dx - x) <= b;
                 bool onTop = (y - wrc.y) < b;
                 bool onBottom = (wrc.y + wrc.dy - y) <= b;

@@ -704,7 +704,9 @@ void SaveCurrentWindowTab(MainWindow* win) {
     WindowTab* tab = win->CurrentTab();
     if (win->tocLoaded && tab->ctrl) {
         TocTree* tocTree = tab->ctrl->GetToc();
-        UpdateTocExpansionState(tab->tocState, win->tocTreeView, tocTree);
+        if (tocTree) {
+            UpdateTocExpansionState(tab->tocState, win->tocTreeView, tocTree);
+        }
     }
     VerifyWindowTab(win, tab);
 

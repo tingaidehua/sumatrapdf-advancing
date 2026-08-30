@@ -32,6 +32,7 @@
 #include "Theme.h"
 #include "Translations.h"
 
+#include "FilterHighlightDraw.h"
 #include "LibraryPanel.h"
 #include "SumatraLog.h"
 
@@ -53,6 +54,7 @@ struct LibraryTreeItem {
     Str path;
     i64 bookId = 0;
     i64 collectionId = 0;
+    bool isShelf = false;
     bool expanded = false;
 };
 
@@ -121,8 +123,6 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
         return model;
     }
 
-    AddBooks(model->root, LibraryBookScope::ManualRoot, 0, filter);
-
     Vec<LibraryCollection*> collections = LibraryStoreGetCollections(LibraryGetStore());
     Vec<LibraryTreeItem*> collectionItems;
     for (LibraryCollection* collection : collections) {
@@ -130,6 +130,7 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
         item->kind = LibraryTreeKind::Collection;
         item->text = str::Dup(collection->name);
         item->collectionId = collection->id;
+        item->isShelf = collection->isShelf;
         item->expanded =
             filter ? true
                    : (!win->libraryExpansionInitialized ? collection->isShelf
@@ -153,6 +154,7 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
         AddBooks(item, LibraryBookScope::Collection, collection->id, filter);
     }
     DeleteLibraryCollections(collections);
+    AddBooks(model->root, LibraryBookScope::ManualRoot, 0, filter);
     if (filter) {
         PruneEmptyCollections(model->root);
     }
@@ -219,25 +221,38 @@ void SyncLibrarySelection(MainWindow* win) {
         return;
     }
     auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
-    LibraryTreeItem* book = FindBookByPath(model->root, CurrentPdfPath(win));
+    Str path = CurrentPdfPath(win);
+    LibraryTreeItem* book = FindBookByPath(model->root, path);
     TreeItem want = book ? (TreeItem)book : TreeModel::kNullItem;
     if (win->libraryTreeView->GetSelection() == want) {
         return;
     }
+    logf("SyncLibrarySelection: path='%s' book=%d\n", path ? path : StrL(""), book ? 1 : 0);
     win->libraryTreeView->SelectItem(want);
     if (!book) {
         return;
     }
     HTREEITEM hi = win->libraryTreeView->GetHandleByTreeItem((TreeItem)book);
-    if (hi) {
-        TreeView_EnsureVisible(win->libraryTreeView->hwnd, hi);
+    if (!hi) {
+        return;
     }
+    RECT itemRc{};
+    RECT clientRc{};
+    if (TreeView_GetItemRect(win->libraryTreeView->hwnd, hi, &itemRc, FALSE) &&
+        GetClientRect(win->libraryTreeView->hwnd, &clientRc)) {
+        if (itemRc.top >= 0 && itemRc.bottom <= clientRc.bottom) {
+            return;
+        }
+    }
+    TreeView_EnsureVisible(win->libraryTreeView->hwnd, hi);
 }
 
 void RefreshLibraryPanel(MainWindow* win) {
     if (!win || !win->libraryTreeView) return;
+    logf("RefreshLibraryPanel: begin\n");
     if (win->libraryDragging) ReleaseCapture();
     win->libraryDragItem = 0;
+    win->libraryDropItem = 0;
     win->libraryDragging = false;
     RememberExpandedCollections(win);
     TempStr filter = FilterTextTemp(win);
@@ -247,6 +262,7 @@ void RefreshLibraryPanel(MainWindow* win) {
     win->libraryExpansionInitialized = true;
     delete previous;
     SyncLibrarySelection(win);
+    logf("RefreshLibraryPanel: end\n");
 }
 
 void RefreshLibraryPanels() {
@@ -273,14 +289,6 @@ static void OpenLibraryItem(MainWindow* source, LibraryTreeItem* item) {
     StartLoadDocument(&args);
 }
 
-static void OnTreeClick(TreeView::ClickEvent* ev) {
-    if (!ev->treeItem) return;
-    auto* item = (LibraryTreeItem*)ev->treeItem;
-    if (item->kind != LibraryTreeKind::Book) return;
-    MainWindow* win = FindMainWindowByHwnd(ev->treeView->hwnd);
-    OpenLibraryItem(win, item);
-}
-
 static void OnTreeTooltip(TreeView::GetTooltipEvent* ev) {
     auto* item = (LibraryTreeItem*)ev->treeItem;
     if (item && item->path) {
@@ -288,13 +296,159 @@ static void OnTreeTooltip(TreeView::GetTooltipEvent* ev) {
     }
 }
 
+static void SplitBookLabel(LibraryTreeItem* item, Str& stem, Str& ext) {
+    Str name = item && item->text ? item->text : Str();
+    if (str::EndsWithI(name, StrL(".pdf"))) {
+        stem = Str(name.s, len(name) - 4);
+        ext = StrL(".pdf");
+        return;
+    }
+    stem = name;
+    ext = item && item->path && str::EndsWithI(item->path, StrL(".pdf")) ? StrL(".pdf") : Str();
+}
+
+static void DrawLibraryFade(Gfx* gfx, Rect rc, Color bg) {
+    int fadeDx = std::min(rc.dx, DpiScale(22));
+    if (fadeDx <= 0) {
+        return;
+    }
+    constexpr int kSteps = 8;
+    for (int i = 0; i < kSteps; i++) {
+        int x0 = rc.x + rc.dx - fadeDx + fadeDx * i / kSteps;
+        int x1 = rc.x + rc.dx - fadeDx + fadeDx * (i + 1) / kSteps;
+        Rect strip{x0, rc.y, std::max(1, x1 - x0), rc.dy};
+        gfx->FillRects(&strip, 1, bg, (u8)(255 * (i + 1) / kSteps));
+    }
+}
+
+static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
+    auto* item = (LibraryTreeItem*)ev->treeItem;
+    if (!item) {
+        return;
+    }
+    TreeView* tv = ev->treeView;
+    Rect labelRect{};
+    if (!tv->GetItemRect(ev->treeItem, true, labelRect)) {
+        return;
+    }
+    Rect itemRect{};
+    tv->GetItemRect(ev->treeItem, false, itemRect);
+
+    NMTVCUSTOMDRAW* tvcd = ev->nm;
+    HDC hdc = tvcd->nmcd.hdc;
+    NMCUSTOMDRAW* cd = &tvcd->nmcd;
+    bool isSelected = (cd->uItemState & CDIS_SELECTED) != 0;
+    if (!isSelected) {
+        HTREEITEM hSel = TreeView_GetSelection(tv->hwnd);
+        HTREEITEM hItem = tv->GetHandleByTreeItem(ev->treeItem);
+        isSelected = hSel && hItem && hSel == hItem;
+    }
+    bool isDrop = win && win->libraryDropItem && win->libraryDropItem == (uintptr_t)item;
+    bool hasFocus = isSelected && GetFocus() == tv->hwnd;
+    Color bgCol, txtCol;
+    ResolveTreeFilterItemColors(hdc, itemRect, tv->bgColor, tv->textColor, isSelected || isDrop, hasFocus, &bgCol,
+                                &txtCol);
+
+    RECT client{};
+    GetClientRect(tv->hwnd, &client);
+    RECT drawRc = ToRECT(labelRect);
+    drawRc.top = itemRect.dy > 0 ? itemRect.y : drawRc.top;
+    drawRc.bottom = itemRect.dy > 0 ? itemRect.y + itemRect.dy : drawRc.bottom;
+    drawRc.right = client.right;
+    if (drawRc.right <= drawRc.left) {
+        return;
+    }
+    Rect drawRect = ToRect(drawRc);
+    GfxHdc gfx(hdc);
+    // Cover the default TreeView label completely. POSTPAINT used to fade over
+    // it, so the tail of the filename stayed visible under the pinned ".pdf".
+    gfx.FillRect(drawRect, bgCol);
+    Rect textRect = drawRect;
+    textRect.Inflate(-2, -1);
+
+    if (item->kind == LibraryTreeKind::Book) {
+        Str stem, ext;
+        SplitBookLabel(item, stem, ext);
+        Size extSize = ext ? gfx.MeasureText(ext, tv->GetFont()) : Size{};
+        int extDx = ext ? extSize.dx : 0;
+        Rect stemRect = textRect;
+        stemRect.dx = std::max(0, textRect.dx - extDx);
+        Size stemSize = stem ? gfx.MeasureText(stem, tv->GetFont()) : Size{};
+        if (stem && stemRect.dx > 0) {
+            int saved = SaveDC(hdc);
+            IntersectClipRect(hdc, stemRect.x, stemRect.y, stemRect.x + stemRect.dx, stemRect.y + stemRect.dy);
+            gfx.DrawText(stem, stemRect, gfxTextVCenter | gfxTextEllipsis, tv->GetFont(), txtCol);
+            RestoreDC(hdc, saved);
+        }
+        if (stemSize.dx > stemRect.dx) {
+            DrawLibraryFade(&gfx, stemRect, bgCol);
+        }
+        if (ext) {
+            Rect extRect = textRect;
+            extRect.x = stemRect.x + stemRect.dx;
+            extRect.dx = extDx;
+            gfx.FillRect(extRect, bgCol);
+            gfx.DrawText(ext, extRect, gfxTextVCenter | gfxTextEllipsis, tv->GetFont(), txtCol);
+        }
+    } else {
+        gfx.DrawText(item->text, textRect, gfxTextVCenter | gfxTextEllipsis, tv->GetFont(), txtCol);
+    }
+    if (isDrop && !isSelected) {
+        gfx.DrawRect(drawRect, txtCol);
+    }
+}
+
+static void OnLibraryCustomDraw(TreeView::CustomDrawEvent* ev) {
+    ev->result = CDRF_DODEFAULT;
+    NMCUSTOMDRAW* cd = &ev->nm->nmcd;
+    if (cd->dwDrawStage == CDDS_PREPAINT) {
+        ev->result = CDRF_NOTIFYITEMDRAW;
+        return;
+    }
+    if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+        // Hide the default label; we paint stem + pinned extension ourselves.
+        ev->nm->clrText = ev->nm->clrTextBk;
+        ev->result = CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT;
+        return;
+    }
+    if (cd->dwDrawStage == CDDS_ITEMPOSTPAINT) {
+        DrawLibraryItem(ev, FindMainWindowByHwnd(ev->treeView->hwnd));
+        ev->result = CDRF_DODEFAULT;
+    }
+}
+
+static i64 CollectionIdForItem(LibraryTreeItem* item) {
+    if (!item) {
+        return 0;
+    }
+    if (item->kind == LibraryTreeKind::Collection) {
+        return item->collectionId;
+    }
+    if (item->kind == LibraryTreeKind::Book && item->parent && item->parent->kind == LibraryTreeKind::Collection) {
+        return item->parent->collectionId;
+    }
+    return 0;
+}
+
+static void SetLibraryDropItem(MainWindow* win, TreeItem item) {
+    if (!win || win->libraryDropItem == (uintptr_t)item) {
+        return;
+    }
+    win->libraryDropItem = (uintptr_t)item;
+    if (win->libraryTreeView) {
+        HwndInvalidate(win->libraryTreeView->hwnd);
+    }
+}
+
 enum {
     kLibraryMenuRemoveBook = 1,
     kLibraryMenuDeleteCollection,
     kLibraryMenuRenameCollection,
+    kLibraryMenuNewCategory,
 };
 
 static Str PromptLibraryText(HWND parent, Str title, Str label);
+static bool CreateNamedCollection(MainWindow* win, i64 parentId, bool isShelf);
 
 static void OnTreeContextMenu(ContextMenuEvent* ev) {
     MainWindow* win = FindMainWindowByHwnd(ev->w->hwnd);
@@ -307,81 +461,124 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     if (item->kind == LibraryTreeKind::Book) {
         AppendMenuW(menu, MF_STRING, kLibraryMenuRemoveBook, CWStrTemp(_TRA("Remove from Library")));
     } else if (item->kind == LibraryTreeKind::Collection) {
-        AppendMenuW(menu, MF_STRING, kLibraryMenuRenameCollection, CWStrTemp(_TRA("Rename Shelf or Category")));
+        if (item->isShelf) {
+            AppendMenuW(menu, MF_STRING, kLibraryMenuNewCategory, CWStrTemp(_TRA("New Category")));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+        AppendMenuW(menu, MF_STRING, kLibraryMenuRenameCollection,
+                    CWStrTemp(item->isShelf ? _TRA("Rename Shelf") : _TRA("Rename Category")));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kLibraryMenuDeleteCollection, CWStrTemp(_TRA("Delete Shelf or Category")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuDeleteCollection,
+                    CWStrTemp(item->isShelf ? _TRA("Delete Shelf") : _TRA("Delete Category")));
     }
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ev->mouseScreen.x, ev->mouseScreen.y, 0,
                              win->hwndFrame, nullptr);
     DestroyMenu(menu);
-    if (cmd == kLibraryMenuRemoveBook) LibraryStoreRemoveBook(LibraryGetStore(), item->bookId);
-    if (cmd == kLibraryMenuDeleteCollection) LibraryStoreDeleteCollection(LibraryGetStore(), item->collectionId);
-    if (cmd == kLibraryMenuRenameCollection) {
-        Str name = PromptLibraryText(win->hwndFrame, _TRA("Rename Shelf or Category"), _TRA("New name"));
+    bool changed = false;
+    if (cmd == kLibraryMenuRemoveBook) {
+        changed = LibraryStoreRemoveBook(LibraryGetStore(), item->bookId);
+    } else if (cmd == kLibraryMenuDeleteCollection) {
+        changed = LibraryStoreDeleteCollection(LibraryGetStore(), item->collectionId);
+    } else if (cmd == kLibraryMenuRenameCollection) {
+        Str name = PromptLibraryText(win->hwndFrame, item->isShelf ? _TRA("Rename Shelf") : _TRA("Rename Category"),
+                                     _TRA("New name"));
         if (name) {
-            LibraryStoreRenameCollection(LibraryGetStore(), item->collectionId, name);
+            changed = LibraryStoreRenameCollection(LibraryGetStore(), item->collectionId, name);
             str::Free(name);
         }
+    } else if (cmd == kLibraryMenuNewCategory) {
+        changed = CreateNamedCollection(win, item->collectionId, false);
     }
-    if (cmd) RefreshLibraryPanels();
+    if (changed) RefreshLibraryPanels();
 }
 
 static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     MainWindow* win = (MainWindow*)data;
     if (msg == WM_LBUTTONDOWN && win && win->libraryTreeView) {
-        win->libraryDragItem = win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        TVHITTESTINFO ht{};
+        ht.pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        TreeView_HitTest(hwnd, &ht);
+        // +/- is expand, not a drag handle.
+        win->libraryDragItem = (ht.flags & TVHT_ONITEMBUTTON) ? 0 : win->libraryTreeView->GetTreeItemByHandle(ht.hItem);
         win->libraryDragStart = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         win->libraryDragging = false;
+        SetLibraryDropItem(win, 0);
     }
     if (msg == WM_MOUSEMOVE && win && win->libraryDragItem && (wp & MK_LBUTTON)) {
         int dx = std::abs(GET_X_LPARAM(lp) - win->libraryDragStart.x);
         int dy = std::abs(GET_Y_LPARAM(lp) - win->libraryDragStart.y);
-        if (!win->libraryDragging && (dx >= GetSystemMetrics(SM_CXDRAG) || dy >= GetSystemMetrics(SM_CYDRAG))) {
+        if (!win->libraryDragging && (dx >= 3 || dy >= 3)) {
             win->libraryDragging = true;
             SetCapture(hwnd);
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         }
-        if (win->libraryDragging) return 0;
+        if (win->libraryDragging) {
+            RECT clientRc{};
+            GetClientRect(hwnd, &clientRc);
+            int y = GET_Y_LPARAM(lp);
+            int edge = DpiScale(28);
+            if (y < edge) {
+                SendMessageW(hwnd, WM_VSCROLL, SB_LINEUP, 0);
+            } else if (y > clientRc.bottom - edge) {
+                SendMessageW(hwnd, WM_VSCROLL, SB_LINEDOWN, 0);
+            }
+            auto* hover = (LibraryTreeItem*)win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            if (hover && hover->kind == LibraryTreeKind::Collection) {
+                HTREEITEM hi = win->libraryTreeView->GetHandleByTreeItem((TreeItem)hover);
+                if (hi) {
+                    TreeView_Expand(hwnd, hi, TVE_EXPAND);
+                }
+            }
+            SetLibraryDropItem(win, (TreeItem)hover);
+            return 0;
+        }
     }
     if (msg == WM_MOUSEMOVE && win && !win->libraryDragging) {
         TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
-        HwndInvalidate(hwnd);
     }
     if (msg == WM_MOUSELEAVE) {
         HwndInvalidate(hwnd);
     }
-    if (msg == WM_LBUTTONUP && win && win->libraryDragging && win->libraryTreeView) {
+    if (msg == WM_LBUTTONUP && win && win->libraryTreeView) {
         auto* source = (LibraryTreeItem*)win->libraryDragItem;
-        auto* target = (LibraryTreeItem*)win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        bool copy = (wp & MK_CONTROL) != 0;
+        auto* target = (LibraryTreeItem*)win->libraryDropItem;
+        if (!target) {
+            target = (LibraryTreeItem*)win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        }
+        bool wasDragging = win->libraryDragging;
         bool changed = false;
-        if (source && source != target) {
+        if (wasDragging && source && source != target) {
             if (source->kind == LibraryTreeKind::Book) {
-                i64 sourceCollectionId = source->parent && source->parent->kind == LibraryTreeKind::Collection
-                                             ? source->parent->collectionId
-                                             : 0;
-                i64 targetCollectionId =
-                    target && target->kind == LibraryTreeKind::Collection ? target->collectionId : 0;
-                if (!target || target->kind == LibraryTreeKind::Collection) {
-                    changed = LibraryStorePlaceBook(LibraryGetStore(), source->bookId, sourceCollectionId,
-                                                    targetCollectionId, copy);
-                }
-            } else if (!copy && source->kind == LibraryTreeKind::Collection && target &&
-                       target->kind == LibraryTreeKind::Collection) {
-                changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, target->collectionId);
-            } else if (!copy && source->kind == LibraryTreeKind::Collection && !target) {
+                changed = LibraryStorePlaceBook(LibraryGetStore(), source->bookId, CollectionIdForItem(source),
+                                                CollectionIdForItem(target), false);
+            } else if (source->kind == LibraryTreeKind::Collection && source->isShelf && !target) {
                 changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, 0);
+            } else if (source->kind == LibraryTreeKind::Collection && !source->isShelf && target &&
+                       target->kind == LibraryTreeKind::Collection && target->isShelf) {
+                changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, target->collectionId);
             }
         }
-        ReleaseCapture();
+        if (win->libraryDragging) {
+            ReleaseCapture();
+        }
         win->libraryDragItem = 0;
         win->libraryDragging = false;
-        if (changed) RefreshLibraryPanels();
+        SetLibraryDropItem(win, 0);
+        if (changed) {
+            RefreshLibraryPanels();
+            return 0;
+        }
+        if (!wasDragging && source && source->kind == LibraryTreeKind::Book) {
+            OpenLibraryItem(win, source);
+            return 0;
+        }
         return 0;
     }
     if (msg == WM_CAPTURECHANGED && win) {
         win->libraryDragItem = 0;
         win->libraryDragging = false;
+        SetLibraryDropItem(win, 0);
     }
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
@@ -392,7 +589,6 @@ static void CloseLibrary(MainWindow* win, VirtMouseEvent*) {
 
 enum {
     kLibraryAddShelf = 1,
-    kLibraryAddCategory,
     kLibraryAddPdf,
     kLibraryImportDir,
     kLibraryReplacePath,
@@ -478,6 +674,28 @@ static Str PromptLibraryText(HWND parent, Str title, Str label) {
         return {};
     }
     return state.result;
+}
+
+static bool CreateNamedCollection(MainWindow* win, i64 parentId, bool isShelf) {
+    Str title = isShelf ? _TRA("New Shelf") : _TRA("New Category");
+    Str label = isShelf ? _TRA("Shelf name") : _TRA("Category name");
+    Str name = PromptLibraryText(win->hwndFrame, title, label);
+    if (!name) {
+        return false;
+    }
+    LibraryCollection* created = LibraryStoreCreateCollection(LibraryGetStore(), parentId, isShelf, name);
+    if (!created) {
+        logf("Library failed to create %s '%s': %s\n", isShelf ? StrL("shelf") : StrL("category"), name,
+             LibraryGetError());
+        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("Could not create the shelf or category.")), CWStrTemp(title),
+                    MB_OK | MB_ICONWARNING);
+        str::Free(name);
+        return false;
+    }
+    logf("Library created %s '%s' id=%lld\n", isShelf ? StrL("shelf") : StrL("category"), name, created->id);
+    DeleteLibraryCollection(created);
+    str::Free(name);
+    return true;
 }
 
 static i64 SelectedCollectionId(MainWindow* win) {
@@ -620,7 +838,6 @@ static void ImportPdfDirectory(MainWindow* win) {
 static void AddMenu(MainWindow* win, VirtMouseEvent* ev) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kLibraryAddShelf, CWStrTemp(_TRA("New Shelf")));
-    AppendMenuW(menu, MF_STRING, kLibraryAddCategory, CWStrTemp(_TRA("New Category")));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kLibraryAddPdf, CWStrTemp(_TRA("Add PDF...")));
     AppendMenuW(menu, MF_STRING, kLibraryImportDir, CWStrTemp(_TRA("Import PDF Directory...")));
@@ -630,16 +847,7 @@ static void AddMenu(MainWindow* win, VirtMouseEvent* ev) {
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
     DestroyMenu(menu);
     if (cmd == kLibraryAddShelf) {
-        Str name = PromptLibraryText(win->hwndFrame, _TRA("New Shelf"), _TRA("Shelf name"));
-        DeleteLibraryCollection(LibraryStoreCreateCollection(LibraryGetStore(), 0, true, name));
-        str::Free(name);
-    } else if (cmd == kLibraryAddCategory) {
-        i64 parentId = SelectedCollectionId(win);
-        if (parentId) {
-            Str name = PromptLibraryText(win->hwndFrame, _TRA("New Category"), _TRA("Category name"));
-            DeleteLibraryCollection(LibraryStoreCreateCollection(LibraryGetStore(), parentId, false, name));
-            str::Free(name);
-        }
+        if (CreateNamedCollection(win, 0, true)) RefreshLibraryPanels();
     } else if (cmd == kLibraryAddPdf) {
         AddPdfFiles(win);
     } else if (cmd == kLibraryImportDir) {
@@ -647,7 +855,6 @@ static void AddMenu(MainWindow* win, VirtMouseEvent* ev) {
     } else if (cmd == kLibraryReplacePath) {
         ReplaceLibraryPathPrefix(win);
     }
-    if (cmd == kLibraryAddShelf || cmd == kLibraryAddCategory) RefreshLibraryPanels();
 }
 
 void LayoutLibraryPanel(MainWindow* win) {
@@ -659,9 +866,22 @@ void LayoutLibraryPanel(MainWindow* win) {
 
 static WNDPROC gLibraryBoxWndProc = nullptr;
 
+static int LibraryLeftGutterDx() {
+    return DpiScale(kLibraryLeftGutterDip);
+}
+
 static LRESULT CALLBACK LibraryBoxWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     MainWindow* win = FindMainWindowByHwnd(hwnd);
     if (!win) return CallWindowProcW(gLibraryBoxWndProc, hwnd, msg, wp, lp);
+    // The library HWND covers the frame's left resize strip. Let the parent
+    // see that edge so the cursor can become HTLEFT.
+    if (msg == WM_NCHITTEST) {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        if (pt.x >= 0 && pt.x < LibraryLeftGutterDx()) {
+            return HTTRANSPARENT;
+        }
+    }
     LRESULT result = 0;
     result = TryReflectMessages(hwnd, msg, wp, lp);
     if (result) return result;
@@ -673,7 +893,8 @@ static LRESULT CALLBACK LibraryBoxWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 static VirtIconButton* HeaderButton(const char* svg, Str tooltip, const VirtMouseHandler& onClick) {
     auto* button = new VirtIconButton();
     button->pixmap = GetCachedPixmapForSvg(Str(svg), DpiScale(16), DpiScale(16));
-    button->padding = Insets{5, 5, 5, 5};
+    int pad = DpiScale(2);
+    button->padding = Insets{0, pad, 0, pad};
     button->onClick = onClick;
     button->SetTooltip(tooltip);
     return button;
@@ -687,12 +908,14 @@ void CreateLibraryPanel(MainWindow* win) {
     auto header = NewLabelWithClose(win->hwndLibraryBox, labelFont, MkFunc1(CloseLibrary, win));
     win->libraryLabel = header.label;
     header.label->SetText(_TRA("Library"));
-
-    auto* actions = new HBox();
-    actions->alignCross = CrossAxisAlign::CrossCenter;
     win->libraryAddButton = HeaderButton(gIconPlus, _TRA("Add to Library"), MkFunc1(AddMenu, win));
-    actions->AddChild(win->libraryAddButton);
-    actions->AddChild(new Spacer(0, 0), 1);
+    // Insert + immediately before the close button so the search field sits
+    // on the same row as the bookmarks search (no extra action row).
+    if (len(header.box->children) > 0) {
+        header.box->children.Pop();
+    }
+    header.box->AddChild(win->libraryAddButton);
+    header.box->AddChild(header.closeBtn);
 
     auto* filter = new Edit();
     Edit::CreateArgs editArgs;
@@ -710,28 +933,29 @@ void CreateLibraryPanel(MainWindow* win) {
     treeArgs.font = GetAppTreeFont();
     treeArgs.fullRowSelect = true;
     treeArgs.isRtl = IsUIRtl();
-    tree->onClick = MkFunc1Void(OnTreeClick);
     tree->onContextMenu = MkFunc1Void(OnTreeContextMenu);
     tree->onGetTooltip = MkFunc1Void(OnTreeTooltip);
+    tree->onCustomDraw = MkFunc1Void(OnLibraryCustomDraw);
     tree->Create(treeArgs);
+    LONG_PTR noDrag = GetWindowLongPtrW(tree->hwnd, GWL_STYLE);
+    SetWindowLongPtrW(tree->hwnd, GWL_STYLE, noDrag | TVS_DISABLEDRAGDROP);
     // Keep the tree's client width stable while switching documents. The
     // library model changes the number of rows, and letting Windows add/remove
     // the vertical scrollbar changes the pane's right edge by one scrollbar
     // width, which makes the adjacent chrome appear to shift.
     LONG_PTR treeStyle = GetWindowLongPtrW(tree->hwnd, GWL_STYLE);
     SetWindowLongPtrW(tree->hwnd, GWL_STYLE, treeStyle | WS_VSCROLL);
-    ShowScrollBar(tree->hwnd, SB_VERT, FALSE);
+    ShowScrollBar(tree->hwnd, SB_VERT, TRUE);
     win->libraryTreeView = tree;
     SetWindowSubclass(tree->hwnd, LibraryTreeSubclassProc, NextSubclassId(), (DWORD_PTR)win);
 
     auto* layout = new VBox();
     layout->alignCross = CrossAxisAlign::Stretch;
     layout->AddChild(header.box);
-    layout->AddChild(actions);
     layout->AddChild(filter);
     layout->AddChild(new Spacer(0, 2));
     layout->AddChild(tree, 1);
-    win->libraryLayout = layout;
+    win->libraryLayout = new Padding(layout, Insets{0, 0, 0, LibraryLeftGutterDx()});
 
     if (!gLibraryBoxWndProc) gLibraryBoxWndProc = (WNDPROC)GetWindowLongPtrW(win->hwndLibraryBox, GWLP_WNDPROC);
     SetWindowLongPtrW(win->hwndLibraryBox, GWLP_WNDPROC, (LONG_PTR)LibraryBoxWndProc);
@@ -760,5 +984,192 @@ void SetLibraryPanelVisible(MainWindow* win, bool visible) {
     win->uiState.libraryVisible = visible;
     if (!visible && win->libraryTreeView && HwndIsFocused(win->libraryTreeView->hwnd)) HwndSetFocus(win->hwndFrame);
     SaveSettings();
-    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars | kUiSidebarDirty);
+    bool toc = win->CurrentTab() && win->CurrentTab()->showToc;
+    logf("SetLibraryPanelVisible: visible=%d tocPref=%d\n", visible ? 1 : 0, toc ? 1 : 0);
+    SetSidebarVisibility(win, toc, gGlobalPrefs->showFavorites);
+}
+
+static void AppendLibraryStatus(str::Builder& out, MainWindow* win) {
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    Str path = tab && tab->filePath ? tab->filePath : Str();
+    out.Append(fmt("libraryVis=%d tocVis=%d showToc=%d libraryDx=%d sidebarDx=%d tabs=%d path=%s\n",
+                   win && win->uiState.libraryVisible ? 1 : 0, win && win->uiState.tocVisible ? 1 : 0,
+                   tab && tab->showToc ? 1 : 0, win ? win->libraryDx : 0, win ? win->sidebarDx : 0,
+                   win ? win->TabCount() : 0, path ? path : StrL("")));
+}
+
+TempStr LibraryDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exitCodeOut) {
+    str::Builder out;
+    auto finish = [&](Str msg, int code) -> TempStr {
+        if (msg) {
+            out.Append(msg);
+        }
+        if (!str::EndsWith(ToStr(out), StrL("\n"))) {
+            out.AppendChar('\n');
+        }
+        if (exitCodeOut) {
+            *exitCodeOut = code;
+        }
+        return ToStrTemp(out);
+    };
+
+    if (len(gWindows) == 0) {
+        return finish(StrL("NOTREADY no-window"), 2);
+    }
+    MainWindow* win = gWindows[0];
+    if (!win) {
+        return finish(StrL("NOTREADY no-window"), 2);
+    }
+
+    if (!action || str::EqI(action, "status")) {
+        out.Append(StrL("OK "));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "show") || str::EqI(action, "hide")) {
+        SetLibraryPanelVisible(win, str::EqI(action, "show"));
+        out.Append(StrL("OK "));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), win->uiState.libraryVisible == str::EqI(action, "show") ? 0 : 1);
+    }
+
+    if (str::EqI(action, "toc-show") || str::EqI(action, "toc-hide")) {
+        bool want = str::EqI(action, "toc-show");
+        SetSidebarVisibility(win, want, gGlobalPrefs->showFavorites);
+        out.Append(StrL("OK "));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), win->uiState.tocVisible == want ? 0 : 1);
+    }
+
+    if (str::EqI(action, "refresh")) {
+        RefreshLibraryPanel(win);
+        return finish(StrL("OK refreshed"), 0);
+    }
+
+    if (str::EqI(action, "open")) {
+        if (!a) {
+            return finish(StrL("ERROR open expects path"), 1);
+        }
+        logf("LibraryDbg: open '%s'\n", a);
+        LoadArgs args(a, win);
+        args.activateExisting = true;
+        MainWindow* loaded = LoadDocument(&args);
+        if (!loaded) {
+            return finish(fmt("ERROR open-failed path=%s", a), 1);
+        }
+        out.Append(StrL("OK "));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "switch-tab")) {
+        int nTabs = win->TabCount();
+        if (n1 < 0 || n1 >= nTabs) {
+            return finish(fmt("ERROR bad-tab idx=%d tabs=%d", n1, nTabs), 1);
+        }
+        logf("LibraryDbg: switch-tab %d\n", n1);
+        ULONGLONG t0 = GetTickCount64();
+        TabsSelect(win, n1);
+        out.Append(fmt("OK idx=%d elapsedMs=%llu ", n1, GetTickCount64() - t0));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "tabs")) {
+        out.Append(fmt("OK count=%d\n", win->TabCount()));
+        for (int i = 0; i < win->TabCount(); i++) {
+            WindowTab* tab = win->GetTab(i);
+            Str path = tab && tab->filePath ? tab->filePath : StrL("");
+            out.Append(fmt("tab idx=%d current=%d path=%s\n", i, tab == win->CurrentTab() ? 1 : 0, path));
+        }
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "list")) {
+        if (!LibraryIsAvailable()) {
+            return finish(StrL("ERROR library-unavailable"), 1);
+        }
+        Vec<LibraryCollection*> cols = LibraryStoreGetCollections(LibraryGetStore());
+        Vec<LibraryBook*> books =
+            LibraryStoreGetBooks(LibraryGetStore(), LibraryBookScope::All, 0, LibrarySort::Title, Str());
+        out.Append(fmt("OK collections=%d books=%d\n", len(cols), len(books)));
+        for (LibraryCollection* c : cols) {
+            out.Append(fmt("col id=%lld parent=%lld shelf=%d name=%s\n", c->id, c->parentId, c->isShelf ? 1 : 0,
+                           c->name ? c->name : StrL("")));
+        }
+        for (LibraryBook* book : books) {
+            out.Append(fmt("book id=%lld title=%s path=%s\n", book->id, book->title ? book->title : StrL(""),
+                           book->path ? book->path : StrL("")));
+        }
+        DeleteLibraryCollections(cols);
+        DeleteLibraryBooks(books);
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "new-shelf")) {
+        if (!a) {
+            return finish(StrL("ERROR new-shelf expects name"), 1);
+        }
+        LibraryCollection* created = LibraryStoreCreateCollection(LibraryGetStore(), 0, true, a);
+        if (!created) {
+            return finish(fmt("ERROR create-shelf name=%s err=%s", a, LibraryGetError()), 1);
+        }
+        i64 id = created->id;
+        DeleteLibraryCollection(created);
+        RefreshLibraryPanels();
+        return finish(fmt("OK shelf=%lld name=%s", id, a), 0);
+    }
+
+    if (str::EqI(action, "place")) {
+        if (n1 <= 0 || n2 < 0) {
+            return finish(StrL("ERROR place expects bookId targetCollectionId"), 1);
+        }
+        bool ok = LibraryStorePlaceBook(LibraryGetStore(), n1, 0, n2, false);
+        if (!ok) {
+            return finish(fmt("ERROR place book=%d dest=%d err=%s", n1, n2, LibraryGetError()), 1);
+        }
+        RefreshLibraryPanels();
+        return finish(fmt("OK placed book=%d dest=%d", n1, n2), 0);
+    }
+
+    if (str::EqI(action, "stress-switch")) {
+        Vec<int> docTabs;
+        int nTabs = win->TabCount();
+        for (int i = 0; i < nTabs; i++) {
+            WindowTab* tab = win->GetTab(i);
+            if (tab && tab->IsDocLoaded()) {
+                docTabs.Append(i);
+            }
+        }
+        if (len(docTabs) < 2) {
+            return finish(fmt("ERROR need-doc-tabs have=%d", len(docTabs)), 1);
+        }
+        int rounds = n1 > 0 ? n1 : 20;
+        if (rounds > 500) {
+            rounds = 500;
+        }
+        int maxMs = 0;
+        int hangAt = -1;
+        logf("LibraryDbg: stress-switch rounds=%d docTabs=%d libraryVis=%d\n", rounds, len(docTabs),
+             win->uiState.libraryVisible ? 1 : 0);
+        for (int i = 0; i < rounds; i++) {
+            ULONGLONG t0 = GetTickCount64();
+            TabsSelect(win, docTabs[i % len(docTabs)]);
+            int dt = (int)(GetTickCount64() - t0);
+            if (dt > maxMs) {
+                maxMs = dt;
+            }
+            if (dt > 5000) {
+                hangAt = i;
+                logf("LibraryDbg: stress-switch hang i=%d ms=%d\n", i, dt);
+                break;
+            }
+        }
+        out.Append(fmt("OK rounds=%d maxMs=%d hangAt=%d ", rounds, maxMs, hangAt));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), hangAt >= 0 ? 1 : 0);
+    }
+
+    return finish(fmt("ERROR unknown-action action=%s", action), 1);
 }

@@ -49,6 +49,7 @@
 #include "EutlTrust.h"
 #include "CommandPalette.h"
 #include "PdfTools.h"
+#include "LibraryPanel.h"
 
 extern bool gIsStartup;
 TempStr FindHistoryResultTemp(int* exitCodeOut);
@@ -523,6 +524,7 @@ enum class ControlCmd : u16 {
     TestConvertToImages = 69,
     TestLayout = 70,
     TestDpi = 71,
+    TestLibrary = 72,
 };
 
 enum class ControlArgType : u16 {
@@ -1299,6 +1301,24 @@ static void ExecuteControlRequest(ControlRequest* req) {
             Str action = StringArg(req, 0);
             int exitCode = 0;
             Str res = DpiResultTemp(action, &exitCode);
+            AppendTestResult(req, exitCode, res);
+            break;
+        }
+
+        case ControlCmd::TestLibrary: {
+            Str action = StringArg(req, 0);
+            Str argA = StringArg(req, 1);
+            Str argB = StringArg(req, 2);
+            i32 n1 = 0;
+            i32 n2 = 0;
+            IntArg(req, 1, n1);
+            IntArg(req, 2, n2);
+            if (!action) {
+                AppendError(req, "TestLibrary expects string action");
+                break;
+            }
+            int exitCode = 0;
+            Str res = LibraryDbgControlTemp(action, argA, argB, n1, n2, &exitCode);
             AppendTestResult(req, exitCode, res);
             break;
         }

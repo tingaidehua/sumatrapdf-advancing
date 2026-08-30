@@ -878,6 +878,22 @@ void UpdateToolbarState(MainWindow* win) {
     }
 }
 
+static constexpr const char* kToolbarPageTotalReserve = "99999 / 99999";
+
+// Keep the page-count label's layout width stable so later toolbar buttons
+// do not shift when the number of digits changes.
+static void SetToolbarPageTotalText(ToolbarVirt* tb, Str txt) {
+    if (!tb || !tb->pageTotal) {
+        return;
+    }
+    tb->pageTotal->SetText(txt);
+    int pageGap = DpiScale(kTextPaddingRight) + DpiScale(kButtonSpacingX);
+    Size have = PlatformFontMeasureText(tb->platformFont, txt ? txt : StrL(" "));
+    Size want = PlatformFontMeasureText(tb->platformFont, StrL(kToolbarPageTotalReserve));
+    int extra = want.dx > have.dx ? want.dx - have.dx : 0;
+    tb->pageTotal->padding = {0, DpiScale(4), 0, pageGap + extra};
+}
+
 void UpdateToolbarPageText(MainWindow* win, int pageCount, bool updateOnly) {
     VirtHost* host = ToolbarHost(win);
     if (!host) {
@@ -901,7 +917,7 @@ void UpdateToolbarPageText(MainWindow* win, int pageCount, bool updateOnly) {
     if (updateOnly && tb->pageTotal->s && txt && str::Eq(tb->pageTotal->s, txt)) {
         return;
     }
-    tb->pageTotal->SetText(txt);
+    SetToolbarPageTotalText(tb, txt);
     host->Relayout();
     host->Invalidate(true);
 }
@@ -1249,9 +1265,9 @@ static void BuildToolbarLayout(MainWindow* win) {
             auto* total = new VirtText(StrL(" "), tb->platformFont);
             total->isRtl = box->rtl;
             total->SetColor(kColText, fg);
-            total->padding = {0, DpiScale(4), 0, pageGap};
             total->id = PageInfoId;
             tb->pageTotal = total;
+            SetToolbarPageTotalText(tb, StrL(" "));
             box->AddChild(total);
             tb->items.Append(label);
             continue;

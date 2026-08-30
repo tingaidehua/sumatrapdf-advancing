@@ -29,6 +29,7 @@ import { testit as issue476 } from "./issue-476.ts";
 import { testit as issue5875 } from "./issue-5875.ts";
 import { testit as issue3769 } from "./issue-3769.ts";
 import { testit as issue3744 } from "./issue-3744.ts";
+import { testit as librarySidebar } from "./library-sidebar.ts";
 import { testit as issue4973 } from "./issue-4973.ts";
 import { testit as issue5329 } from "./issue-5329.ts";
 import { testit as issue5718 } from "./issue-5718.ts";
@@ -231,6 +232,7 @@ export const tests: NamedTest[] = [
 
   // --- isolated session: -appdata, saveSettings, or own window placement -
   ["issue-3744", issue3744],
+  ["library-sidebar", librarySidebar],
   ["issue-5095", issue5095],
   ["issue-3731", issue3731],
   ["issue-5751", issue5751],

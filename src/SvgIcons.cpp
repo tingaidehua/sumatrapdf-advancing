@@ -20,9 +20,10 @@ const char* gIconHome =
 const char* gIconLibrary =
     R"(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m16 6 4 14"/><path d="M12 6v14"/><path d="M8 8v12"/><path d="M4 4v16"/></svg>)";
 
-// https://lucide.dev/icons/book-marked
+// 24gl-bookmarks2: stacked bookmark. fill uses currentColor so the toolbar
+// theme can recolor it (GetCachedPixmapForSvg replaces currentColor).
 const char* gIconBookmarks =
-    R"(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v8l3-3 3 3V2"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2"/></svg>)";
+    R"(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 1024 1024" fill="currentColor"><path d="M885.333333 42.666667H309.333333a53.393333 53.393333 0 0 0-53.333333 53.333333v32H181.333333a53.393333 53.393333 0 0 0-53.333333 53.333333v778.666667a21.333333 21.333333 0 0 0 32.666667 18.093333l330-206.266666 330 206.266666a21.333333 21.333333 0 0 0 32.666666-18.093333v-142.84l52.666667 32.933333a21.333333 21.333333 0 0 0 32.666667-18.093333V96a53.393333 53.393333 0 0 0-53.333334-53.333333z m-74.666666 878.84l-308.666667-192.933334a21.333333 21.333333 0 0 0-22.613333 0l-308.666667 192.933334V181.333333a10.666667 10.666667 0 0 1 10.666667-10.666666h618.666666a10.666667 10.666667 0 0 1 10.666667 10.666666z m85.333333-128l-42.666667-26.666667V181.333333a53.393333 53.393333 0 0 0-53.333333-53.333333H298.666667v-32a10.666667 10.666667 0 0 1 10.666666-10.666667h576a10.666667 10.666667 0 0 1 10.666667 10.666667z"/></svg>)";
 
 // https://lucide.dev/icons/plus
 const char* gIconPlus =
