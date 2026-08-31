@@ -4,7 +4,7 @@
 struct MainWindow;
 
 // Left inset of the library pane so the frame's HTLEFT hit-test is reachable.
-constexpr int kLibraryLeftGutterDip = 10;
+constexpr int kLibraryLeftGutterDip = 3;
 
 void CreateLibraryPanel(MainWindow* win);
 void LayoutLibraryPanel(MainWindow* win);
