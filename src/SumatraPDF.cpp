@@ -9132,11 +9132,18 @@ static void CopySelectionInTabToClipboard(WindowTab* tab) {
     }
 }
 
-// Directory for nonessential runtime data such as downloaded symbols. Keep it
-// inside the selected portable app-data root so moving the EXE remains self
-// contained.
+// Directory for extracted DLLs / crash dumps / symbols. When settings live on
+// OneDrive, keep this machine-local so multi-hundred-MB build extracts are not
+// synced. Otherwise stay beside the portable app-data root.
 TempStr GetSumatraDataDirTemp() {
-    return path::JoinTemp(GetAppDataDirTemp(), StrL("SumatraPDF-data"));
+    TempStr appDir = GetAppDataDirTemp();
+    if (appDir && str::ContainsI(appDir, StrL("\\OneDrive\\"))) {
+        TempStr local = GetSpecialFolderTemp(CSIDL_LOCAL_APPDATA, true);
+        if (local) {
+            return path::JoinTemp(local, StrL("SumatraPDF"), StrL("SumatraPDF-data"));
+        }
+    }
+    return path::JoinTemp(appDir, StrL("SumatraPDF-data"));
 }
 
 TempStr GetSumatraBuildSpecificDirTemp() {
@@ -9161,6 +9168,18 @@ TempStr GetLogFilePathTemp() {
     return path::JoinTemp(buildDir, StrL("sumatra-log.txt"));
 }
 
+// Durable crash reports (txt + latest dmp). Prefer the shared app-data root so
+// OneDrive-synced machines and rebuilds keep a stable place for AI agents.
+TempStr GetCrashReportsDirTemp() {
+    TempStr appDir = GetAppDataDirTemp();
+    if (!appDir) {
+        return {};
+    }
+    return path::JoinTemp(appDir, StrL("crashes"));
+}
+
+// Build-local scratch used for downloaded symbols; intentionally NOT the
+// durable crash-report folder (Clear History empties this directory).
 TempStr GetCrashInfoDirTemp() {
     TempStr buildDir = GetSumatraBuildSpecificDirTemp();
     if (!buildDir) {

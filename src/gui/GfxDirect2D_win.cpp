@@ -623,8 +623,15 @@ Size GfxDirect2D::MeasureText(Str s, PlatformFont* font) {
 
 // d2d wants 32bpp premultiplied BGRA; a Pixmap can be several other things.
 // Returns the rows to hand it (into `scratch` when a conversion was needed).
+// Returns nullptr when the pixmap cannot be read safely (null/empty/corrupt).
 static const u8* PixmapAsPremulBgra(Pixmap* px, Vec<u8>& scratch, int* strideOut) {
+    if (!px || px->width <= 0 || px->height <= 0) {
+        return nullptr;
+    }
     if (px->format == PixmapFormat::BGRA8 && px->premultiplied) {
+        if (!px->data || px->stride < px->width * 4) {
+            return nullptr;
+        }
         *strideOut = px->stride;
         return px->data;
     }
@@ -638,16 +645,36 @@ static const u8* PixmapAsPremulBgra(Pixmap* px, Vec<u8>& scratch, int* strideOut
         }
         src = owned;
     }
+    if (!src->data || src->width <= 0 || src->height <= 0) {
+        if (owned) {
+            FreePixmap(owned);
+        }
+        return nullptr;
+    }
+    int srcBpp = PixmapBytesPerPixel(src->format);
+    // reject corrupt / freed pixmaps whose stride collapsed (seen as AV at -1
+    // in the conversion loop when data was overwritten after a use-after-free)
+    if (src->stride < src->width * srcBpp) {
+        if (owned) {
+            FreePixmap(owned);
+        }
+        return nullptr;
+    }
     int w = src->width, h = src->height;
     int stride = w * 4;
     scratch.Reset();
     u8* dst = VecReserve(scratch, stride * h);
-    int srcBpp = PixmapBytesPerPixel(src->format);
+    if (!dst) {
+        if (owned) {
+            FreePixmap(owned);
+        }
+        return nullptr;
+    }
     bool isRgba = src->format == PixmapFormat::RGBA8;
     bool hasAlpha = src->format != PixmapFormat::BGR8;
     for (int y = 0; y < h; y++) {
-        const u8* sp = src->data + ((size_t)y * src->stride);
-        u8* dp = dst + ((size_t)y * stride);
+        const u8* sp = src->data + ((size_t)y * (size_t)src->stride);
+        u8* dp = dst + ((size_t)y * (size_t)stride);
         for (int x = 0; x < w; x++, sp += srcBpp, dp += 4) {
             u8 b = isRgba ? sp[2] : sp[0];
             u8 g = sp[1];
@@ -672,7 +699,14 @@ static const u8* PixmapAsPremulBgra(Pixmap* px, Vec<u8>& scratch, int* strideOut
 }
 
 void GfxDirect2D::DrawPixmap(Pixmap* px, const Rect& r) {
-    if (!target || !px || r.IsEmpty()) {
+    // Match GfxMac/GfxGtk: refuse to sample a pixmap with no pixel buffer.
+    // Without this, PixmapAsPremulBgra's conversion loop AVs on null/corrupt data
+    // (crash sumatrapdf.exe+0x1b196a / PixmapAsPremulBgra+0x126).
+    // Native format may only have hbmp; PixmapAsPremulBgra copies via DIB.
+    if (!target || !px || r.IsEmpty() || px->width <= 0 || px->height <= 0) {
+        return;
+    }
+    if (!px->data && px->format != PixmapFormat::Native) {
         return;
     }
     Vec<u8> scratch;

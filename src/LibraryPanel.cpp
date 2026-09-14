@@ -56,6 +56,7 @@ struct LibraryTreeItem {
     i64 collectionId = 0;
     bool isShelf = false;
     bool expanded = false;
+    u32 bgColor = 0;
 };
 
 LibraryTreeItem::~LibraryTreeItem() {
@@ -89,11 +90,12 @@ static LibraryTreeItem* NewItem(LibraryTreeItem* parent, LibraryTreeKind kind, S
 }
 
 static void AddBooks(LibraryTreeItem* parent, LibraryBookScope scope, i64 collectionId, Str filter) {
-    Vec<LibraryBook*> books = LibraryStoreGetBooks(LibraryGetStore(), scope, collectionId, LibrarySort::Title, filter);
+    Vec<LibraryBook*> books = LibraryStoreGetBooks(LibraryGetStore(), scope, collectionId, LibrarySort::Manual, filter);
     for (LibraryBook* book : books) {
         auto* item = NewItem(parent, LibraryTreeKind::Book, book->title);
         item->bookId = book->id;
         item->path = str::Dup(book->path);
+        item->bgColor = book->bgColor;
     }
     DeleteLibraryBooks(books);
 }
@@ -131,6 +133,7 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
         item->text = str::Dup(collection->name);
         item->collectionId = collection->id;
         item->isShelf = collection->isShelf;
+        item->bgColor = collection->bgColor;
         item->expanded =
             filter ? true
                    : (!win->libraryExpansionInitialized ? collection->isShelf
@@ -254,6 +257,7 @@ void RefreshLibraryPanel(MainWindow* win) {
     win->libraryDragItem = 0;
     win->libraryDropItem = 0;
     win->libraryDragging = false;
+    win->libraryDropAfter = false;
     RememberExpandedCollections(win);
     TempStr filter = FilterTextTemp(win);
     TreeModel* previous = win->libraryTreeView->treeModel;
@@ -344,10 +348,19 @@ static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
         isSelected = hSel && hItem && hSel == hItem;
     }
     bool isDrop = win && win->libraryDropItem && win->libraryDropItem == (uintptr_t)item;
+    bool dropAsSibling = isDrop && item->kind == LibraryTreeKind::Book && win->libraryDragItem &&
+                         ((LibraryTreeItem*)win->libraryDragItem)->kind == LibraryTreeKind::Book;
     bool hasFocus = isSelected && GetFocus() == tv->hwnd;
     Color bgCol, txtCol;
-    ResolveTreeFilterItemColors(hdc, itemRect, tv->bgColor, tv->textColor, isSelected || isDrop, hasFocus, &bgCol,
-                                &txtCol);
+    ResolveTreeFilterItemColors(hdc, itemRect, tv->bgColor, tv->textColor, isSelected || (isDrop && !dropAsSibling),
+                                hasFocus, &bgCol, &txtCol);
+    // Song-inspired pale row tint when not selected/drop-highlighted.
+    if (item->bgColor && !isSelected && !(isDrop && !dropAsSibling)) {
+        u8 r = (u8)((item->bgColor >> 16) & 0xff);
+        u8 g = (u8)((item->bgColor >> 8) & 0xff);
+        u8 b = (u8)(item->bgColor & 0xff);
+        bgCol = MkRgb(r, g, b);
+    }
 
     RECT client{};
     GetClientRect(tv->hwnd, &client);
@@ -390,10 +403,18 @@ static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
             gfx.FillRect(extRect, bgCol);
             gfx.DrawText(ext, extRect, gfxTextVCenter | gfxTextEllipsis, tv->GetFont(), txtCol);
         }
+    } else if (item->kind == LibraryTreeKind::Collection) {
+        // Folder emoji distinguishes shelves/categories from book rows.
+        TempStr labeled = fmt("📁 %s", item->text ? item->text : StrL(""));
+        gfx.DrawText(labeled, textRect, gfxTextVCenter | gfxTextEllipsis, tv->GetFont(), txtCol);
     } else {
         gfx.DrawText(item->text, textRect, gfxTextVCenter | gfxTextEllipsis, tv->GetFont(), txtCol);
     }
-    if (isDrop && !isSelected) {
+    if (dropAsSibling) {
+        int y = win->libraryDropAfter ? drawRect.y + drawRect.dy - 1 : drawRect.y;
+        Rect line{drawRect.x, y, drawRect.dx, 2};
+        gfx.FillRect(line, txtCol);
+    } else if (isDrop && !isSelected) {
         gfx.DrawRect(drawRect, txtCol);
     }
 }
@@ -430,22 +451,94 @@ static i64 CollectionIdForItem(LibraryTreeItem* item) {
     return 0;
 }
 
-static void SetLibraryDropItem(MainWindow* win, TreeItem item) {
-    if (!win || win->libraryDropItem == (uintptr_t)item) {
+static void SetLibraryDropItem(MainWindow* win, TreeItem item, bool dropAfter) {
+    if (!win || (win->libraryDropItem == (uintptr_t)item && win->libraryDropAfter == dropAfter)) {
         return;
     }
     win->libraryDropItem = (uintptr_t)item;
+    win->libraryDropAfter = dropAfter;
     if (win->libraryTreeView) {
         HwndInvalidate(win->libraryTreeView->hwnd);
     }
 }
 
 enum {
-    kLibraryMenuRemoveBook = 1,
+    kLibraryMenuOpenFolder = 1,
+    kLibraryMenuRemoveBook,
     kLibraryMenuDeleteCollection,
     kLibraryMenuRenameCollection,
     kLibraryMenuNewCategory,
+    kLibraryMenuColorNone,
+    kLibraryMenuColorFirst,
 };
+
+// Pale Song-dynasty inspired row tints (flat, low chroma). Values are 0x00RRGGBB.
+struct LibraryBgSwatch {
+    const char* name;
+    u32 rgb;
+};
+
+static const LibraryBgSwatch gLibraryBgSwatches[] = {
+    {"月白", 0xD6ECF0}, {"青白", 0xC0EBD7}, {"天水碧", 0xD5EBED}, {"艾绿", 0xD5EFDF},
+    {"竹青", 0xE2EAD9}, {"水色", 0xDCE8E6}, {"藕荷", 0xF0E0E6}, {"藕色", 0xF5E6EA},
+    {"缃色", 0xF4ECD4},
+};
+
+static HBITMAP CreateFlatColorSwatch(u32 rgb, int size) {
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP hbmp = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hbmp || !bits) {
+        return nullptr;
+    }
+    u8 r = (u8)((rgb >> 16) & 0xff);
+    u8 g = (u8)((rgb >> 8) & 0xff);
+    u8 b = (u8)(rgb & 0xff);
+    // Slightly deeper edge for a flat chip outline without shadows.
+    u8 er = (u8)(r * 85 / 100);
+    u8 eg = (u8)(g * 85 / 100);
+    u8 eb = (u8)(b * 85 / 100);
+    auto* px = (u32*)bits;
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            bool edge = x == 0 || y == 0 || x == size - 1 || y == size - 1;
+            u8 cr = edge ? er : r;
+            u8 cg = edge ? eg : g;
+            u8 cb = edge ? eb : b;
+            // BGRA8 in memory: B | G<<8 | R<<16 | A<<24
+            px[y * size + x] = cb | ((u32)cg << 8) | ((u32)cr << 16) | (0xffu << 24);
+        }
+    }
+    return hbmp;
+}
+
+static void AppendLibraryColorMenu(HMENU parent, Vec<HBITMAP>& bitmaps) {
+    HMENU colorMenu = CreatePopupMenu();
+    AppendMenuW(colorMenu, MF_STRING, kLibraryMenuColorNone, CWStrTemp(_TRA("None")));
+    AppendMenuW(colorMenu, MF_SEPARATOR, 0, nullptr);
+    int swatchSize = DpiScale(22);
+    for (int i = 0; i < dimof(gLibraryBgSwatches); i++) {
+        HBITMAP hbmp = CreateFlatColorSwatch(gLibraryBgSwatches[i].rgb, swatchSize);
+        if (hbmp) {
+            bitmaps.Append(hbmp);
+        }
+        MENUITEMINFOW mii{};
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_ID | MIIM_STRING | MIIM_BITMAP | MIIM_FTYPE;
+        mii.fType = MFT_STRING;
+        mii.wID = kLibraryMenuColorFirst + i;
+        mii.dwTypeData = (LPWSTR)CWStrTemp(gLibraryBgSwatches[i].name);
+        mii.hbmpItem = hbmp;
+        InsertMenuItemW(colorMenu, GetMenuItemCount(colorMenu), TRUE, &mii);
+    }
+    AppendMenuW(parent, MF_POPUP, (UINT_PTR)colorMenu, CWStrTemp(_TRA("Background color")));
+}
 
 static Str PromptLibraryText(HWND parent, Str title, Str label);
 static bool CreateNamedCollection(MainWindow* win, i64 parentId, bool isShelf);
@@ -458,13 +551,19 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     auto* item = (LibraryTreeItem*)selected;
     if (!item) return;
     HMENU menu = CreatePopupMenu();
+    Vec<HBITMAP> swatchBitmaps;
     if (item->kind == LibraryTreeKind::Book) {
+        AppendMenuW(menu, MF_STRING, kLibraryMenuOpenFolder, CWStrTemp(_TRA("Show in folder")));
+        AppendLibraryColorMenu(menu, swatchBitmaps);
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kLibraryMenuRemoveBook, CWStrTemp(_TRA("Remove from Library")));
     } else if (item->kind == LibraryTreeKind::Collection) {
         if (item->isShelf) {
             AppendMenuW(menu, MF_STRING, kLibraryMenuNewCategory, CWStrTemp(_TRA("New Category")));
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
+        AppendLibraryColorMenu(menu, swatchBitmaps);
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kLibraryMenuRenameCollection,
                     CWStrTemp(item->isShelf ? _TRA("Rename Shelf") : _TRA("Rename Category")));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -474,8 +573,28 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ev->mouseScreen.x, ev->mouseScreen.y, 0,
                              win->hwndFrame, nullptr);
     DestroyMenu(menu);
+    for (HBITMAP hbmp : swatchBitmaps) {
+        DeleteObject(hbmp);
+    }
     bool changed = false;
-    if (cmd == kLibraryMenuRemoveBook) {
+    if (cmd == kLibraryMenuOpenFolder) {
+        if (item->path) {
+            SumatraOpenPathInDefaultFileManager(item->path);
+        }
+    } else if (cmd == kLibraryMenuColorNone) {
+        if (item->kind == LibraryTreeKind::Book) {
+            changed = LibraryStoreSetBookBgColor(LibraryGetStore(), item->bookId, 0);
+        } else if (item->kind == LibraryTreeKind::Collection) {
+            changed = LibraryStoreSetCollectionBgColor(LibraryGetStore(), item->collectionId, 0);
+        }
+    } else if (cmd >= kLibraryMenuColorFirst && cmd < kLibraryMenuColorFirst + dimof(gLibraryBgSwatches)) {
+        u32 rgb = gLibraryBgSwatches[cmd - kLibraryMenuColorFirst].rgb;
+        if (item->kind == LibraryTreeKind::Book) {
+            changed = LibraryStoreSetBookBgColor(LibraryGetStore(), item->bookId, rgb);
+        } else if (item->kind == LibraryTreeKind::Collection) {
+            changed = LibraryStoreSetCollectionBgColor(LibraryGetStore(), item->collectionId, rgb);
+        }
+    } else if (cmd == kLibraryMenuRemoveBook) {
         changed = LibraryStoreRemoveBook(LibraryGetStore(), item->bookId);
     } else if (cmd == kLibraryMenuDeleteCollection) {
         changed = LibraryStoreDeleteCollection(LibraryGetStore(), item->collectionId);
@@ -502,7 +621,7 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         win->libraryDragItem = (ht.flags & TVHT_ONITEMBUTTON) ? 0 : win->libraryTreeView->GetTreeItemByHandle(ht.hItem);
         win->libraryDragStart = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         win->libraryDragging = false;
-        SetLibraryDropItem(win, 0);
+        SetLibraryDropItem(win, 0, false);
     }
     if (msg == WM_MOUSEMOVE && win && win->libraryDragItem && (wp & MK_LBUTTON)) {
         int dx = std::abs(GET_X_LPARAM(lp) - win->libraryDragStart.x);
@@ -529,7 +648,14 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
                     TreeView_Expand(hwnd, hi, TVE_EXPAND);
                 }
             }
-            SetLibraryDropItem(win, (TreeItem)hover);
+            bool dropAfter = false;
+            if (hover && hover->kind == LibraryTreeKind::Book) {
+                Rect itemRc{};
+                if (win->libraryTreeView->GetItemRect((TreeItem)hover, false, itemRc) && itemRc.dy > 0) {
+                    dropAfter = GET_Y_LPARAM(lp) >= itemRc.y + itemRc.dy / 2;
+                }
+            }
+            SetLibraryDropItem(win, (TreeItem)hover, dropAfter);
             return 0;
         }
     }
@@ -543,13 +669,29 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
     if (msg == WM_LBUTTONUP && win && win->libraryTreeView) {
         auto* source = (LibraryTreeItem*)win->libraryDragItem;
         auto* target = (LibraryTreeItem*)win->libraryDropItem;
+        bool dropAfter = win->libraryDropAfter;
         if (!target) {
             target = (LibraryTreeItem*)win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         }
         bool wasDragging = win->libraryDragging;
+        bool filtered = win->libraryModelFiltered;
         bool changed = false;
-        if (wasDragging && source && source != target) {
-            if (source->kind == LibraryTreeKind::Book) {
+        if (wasDragging && source && source != target && !filtered) {
+            if (source->kind == LibraryTreeKind::Book && target && target->kind == LibraryTreeKind::Book) {
+                i64 srcCol = CollectionIdForItem(source);
+                i64 dstCol = CollectionIdForItem(target);
+                if (srcCol == dstCol) {
+                    changed = LibraryStoreReorderBook(LibraryGetStore(), source->bookId, srcCol, target->bookId,
+                                                     dropAfter);
+                } else {
+                    changed = LibraryStorePlaceBook(LibraryGetStore(), source->bookId, srcCol, dstCol, false);
+                    if (changed) {
+                        changed = LibraryStoreReorderBook(LibraryGetStore(), source->bookId, dstCol, target->bookId,
+                                                          dropAfter) ||
+                                  changed;
+                    }
+                }
+            } else if (source->kind == LibraryTreeKind::Book) {
                 changed = LibraryStorePlaceBook(LibraryGetStore(), source->bookId, CollectionIdForItem(source),
                                                 CollectionIdForItem(target), false);
             } else if (source->kind == LibraryTreeKind::Collection && source->isShelf && !target) {
@@ -564,7 +706,7 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         }
         win->libraryDragItem = 0;
         win->libraryDragging = false;
-        SetLibraryDropItem(win, 0);
+        SetLibraryDropItem(win, 0, false);
         if (changed) {
             RefreshLibraryPanels();
             return 0;
@@ -578,7 +720,7 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
     if (msg == WM_CAPTURECHANGED && win) {
         win->libraryDragItem = 0;
         win->libraryDragging = false;
-        SetLibraryDropItem(win, 0);
+        SetLibraryDropItem(win, 0, false);
     }
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
@@ -1131,6 +1273,25 @@ TempStr LibraryDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exi
         }
         RefreshLibraryPanels();
         return finish(fmt("OK placed book=%d dest=%d", n1, n2), 0);
+    }
+
+    if (str::EqI(action, "reorder")) {
+        // n1=bookId, n2=targetBookId, a="after"|"before", b=collectionId (optional, default 0)
+        if (n1 <= 0 || n2 <= 0) {
+            return finish(StrL("ERROR reorder expects bookId targetBookId [after|before] [collectionId]"), 1);
+        }
+        bool insertAfter = a && str::EqI(a, "after");
+        i64 collectionId = 0;
+        if (b && b.s && b.s[0]) {
+            collectionId = atoi(b.s);
+        }
+        bool ok = LibraryStoreReorderBook(LibraryGetStore(), n1, collectionId, n2, insertAfter);
+        if (!ok) {
+            return finish(fmt("ERROR reorder book=%d target=%d err=%s", n1, n2, LibraryGetError()), 1);
+        }
+        RefreshLibraryPanels();
+        return finish(fmt("OK reordered book=%d target=%d after=%d col=%lld", n1, n2, insertAfter ? 1 : 0, collectionId),
+                      0);
     }
 
     if (str::EqI(action, "stress-switch")) {

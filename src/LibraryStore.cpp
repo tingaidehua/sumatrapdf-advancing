@@ -65,6 +65,8 @@ static Str ColumnTextDup(sqlite3_stmt* stmt, int col) {
     return s ? str::Dup(Str(s, n)) : Str();
 }
 
+static i64 NextSortPos(LibraryStore* store, i64 collectionId);
+
 static LibraryBook* ReadBook(sqlite3_stmt* stmt) {
     auto* book = new LibraryBook();
     book->id = sqlite3_column_int64(stmt, 0);
@@ -73,6 +75,8 @@ static LibraryBook* ReadBook(sqlite3_stmt* stmt) {
     book->openCount = sqlite3_column_int64(stmt, 3);
     book->readingSeconds = sqlite3_column_int64(stmt, 4);
     book->lastReadMs = sqlite3_column_int64(stmt, 5);
+    book->sortPos = sqlite3_column_count(stmt) > 6 ? sqlite3_column_int64(stmt, 6) : 0;
+    book->bgColor = sqlite3_column_count(stmt) > 7 ? (u32)sqlite3_column_int64(stmt, 7) : 0;
     return book;
 }
 
@@ -135,7 +139,8 @@ CREATE TABLE IF NOT EXISTS books (
   reading_seconds INTEGER NOT NULL DEFAULT 0 CHECK(reading_seconds >= 0),
   last_read_ms INTEGER NOT NULL DEFAULT 0,
   created_ms INTEGER NOT NULL,
-  updated_ms INTEGER NOT NULL
+  updated_ms INTEGER NOT NULL,
+  bg_color INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS collections (
   id INTEGER PRIMARY KEY,
@@ -143,12 +148,14 @@ CREATE TABLE IF NOT EXISTS collections (
   kind INTEGER NOT NULL CHECK(kind IN (1, 2)),
   name TEXT NOT NULL,
   created_ms INTEGER NOT NULL,
+  bg_color INTEGER NOT NULL DEFAULT 0,
   UNIQUE(parent_id, name COLLATE NOCASE)
 );
 CREATE TABLE IF NOT EXISTS book_collections (
   book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
   collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
   added_ms INTEGER NOT NULL,
+  sort_pos INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(book_id, collection_id)
 );
 CREATE TABLE IF NOT EXISTS desk_books (
@@ -157,16 +164,96 @@ CREATE TABLE IF NOT EXISTS desk_books (
 );
 CREATE TABLE IF NOT EXISTS manual_books (
   book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
-  added_ms INTEGER NOT NULL
+  added_ms INTEGER NOT NULL,
+  sort_pos INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
 CREATE INDEX IF NOT EXISTS idx_book_collections_collection ON book_collections(collection_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_parent_name
   ON collections(COALESCE(parent_id, 0), name COLLATE NOCASE);
-PRAGMA user_version = 3;
+PRAGMA user_version = 5;
 COMMIT;
 )sql";
     return Exec(store, sql);
+}
+
+static bool TableHasColumn(LibraryStore* store, const char* table, const char* column) {
+    TempStr sql = fmt("PRAGMA table_info(%s)", Str(table));
+    sqlite3_stmt* stmt = Prepare(store, CStrTemp(sql));
+    if (!stmt) {
+        return false;
+    }
+    bool found = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* name = (const char*)sqlite3_column_text(stmt, 1);
+        if (name && str::EqI(Str(name), Str(column))) {
+            found = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static bool MigrateToV4(LibraryStore* store) {
+    bool needBackfill = false;
+    if (!TableHasColumn(store, "book_collections", "sort_pos")) {
+        if (!Exec(store, "ALTER TABLE book_collections ADD COLUMN sort_pos INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+        needBackfill = true;
+    }
+    if (!TableHasColumn(store, "manual_books", "sort_pos")) {
+        if (!Exec(store, "ALTER TABLE manual_books ADD COLUMN sort_pos INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+        needBackfill = true;
+    }
+    if (needBackfill) {
+        // Preserve alphabetical order as the initial manual order so existing
+        // libraries do not reshuffle until the user starts dragging.
+        if (!Exec(store, R"sql(
+UPDATE book_collections
+SET sort_pos = (
+  SELECT COUNT(*)
+  FROM book_collections other
+  JOIN books b_other ON b_other.id = other.book_id
+  JOIN books b_self ON b_self.id = book_collections.book_id
+  WHERE other.collection_id = book_collections.collection_id
+    AND (
+      b_other.title COLLATE NOCASE < b_self.title COLLATE NOCASE
+      OR (b_other.title COLLATE NOCASE = b_self.title COLLATE NOCASE AND other.book_id < book_collections.book_id)
+    )
+);
+UPDATE manual_books
+SET sort_pos = (
+  SELECT COUNT(*)
+  FROM manual_books other
+  JOIN books b_other ON b_other.id = other.book_id
+  JOIN books b_self ON b_self.id = manual_books.book_id
+  WHERE
+    b_other.title COLLATE NOCASE < b_self.title COLLATE NOCASE
+    OR (b_other.title COLLATE NOCASE = b_self.title COLLATE NOCASE AND other.book_id < manual_books.book_id)
+);
+)sql")) {
+            return false;
+        }
+    }
+    return Exec(store, "PRAGMA user_version = 4");
+}
+
+static bool MigrateToV5(LibraryStore* store) {
+    if (!TableHasColumn(store, "books", "bg_color")) {
+        if (!Exec(store, "ALTER TABLE books ADD COLUMN bg_color INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+    }
+    if (!TableHasColumn(store, "collections", "bg_color")) {
+        if (!Exec(store, "ALTER TABLE collections ADD COLUMN bg_color INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+    }
+    return Exec(store, "PRAGMA user_version = 5");
 }
 
 static int SchemaVersion(LibraryStore* store) {
@@ -202,16 +289,28 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     int version = SchemaVersion(store);
-    if (version < 0 || version > 3) {
+    if (version < 0 || version > 5) {
         str::ReplaceWithCopy(&store->error, fmt("unsupported library database version: %d", version));
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
     }
-    if (version < 3) {
-        logf("LibraryStore migrating schema: v%d -> v3\n", version);
+    if (version < 5) {
+        logf("LibraryStore migrating schema: v%d -> v5\n", version);
     }
     if (!CreateSchema(store)) {
+        sqlite3_close(store->db);
+        store->db = nullptr;
+        return store;
+    }
+    // CreateSchema is idempotent for brand-new DBs. Existing tables need ALTER
+    // because CREATE TABLE IF NOT EXISTS will not add new columns.
+    if (!MigrateToV4(store)) {
+        sqlite3_close(store->db);
+        store->db = nullptr;
+        return store;
+    }
+    if (!MigrateToV5(store)) {
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
@@ -304,10 +403,12 @@ RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
     }
     sqlite3_finalize(stmt);
     if (book && addToRoot) {
-        stmt = Prepare(store, "INSERT OR IGNORE INTO manual_books(book_id,added_ms) VALUES(?1,?2)");
+        i64 sortPos = NextSortPos(store, 0);
+        stmt = Prepare(store, "INSERT OR IGNORE INTO manual_books(book_id,added_ms,sort_pos) VALUES(?1,?2,?3)");
         if (stmt) {
             sqlite3_bind_int64(stmt, 1, book->id);
             sqlite3_bind_int64(stmt, 2, nowMs);
+            sqlite3_bind_int64(stmt, 3, sortPos);
             if (sqlite3_step(stmt) != SQLITE_DONE) {
                 SetError(store, StrL("place opened book at library root"));
                 DeleteLibraryBook(book);
@@ -368,10 +469,12 @@ RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
     }
     sqlite3_finalize(stmt);
     if (book) {
-        stmt = Prepare(store, "INSERT OR IGNORE INTO manual_books(book_id,added_ms) VALUES(?1,?2)");
+        i64 sortPos = NextSortPos(store, 0);
+        stmt = Prepare(store, "INSERT OR IGNORE INTO manual_books(book_id,added_ms,sort_pos) VALUES(?1,?2,?3)");
         if (stmt) {
             sqlite3_bind_int64(stmt, 1, book->id);
             sqlite3_bind_int64(stmt, 2, nowMs);
+            sqlite3_bind_int64(stmt, 3, sortPos);
             if (sqlite3_step(stmt) != SQLITE_DONE) {
                 SetError(store, StrL("mark manual book"));
                 DeleteLibraryBook(book);
@@ -454,7 +557,7 @@ bool LibraryStoreAddReadingTime(LibraryStore* store, Str path, i64 seconds, i64 
     return ok;
 }
 
-static const char* SortSql(LibrarySort sort) {
+static const char* SortSql(LibrarySort sort, LibraryBookScope scope) {
     switch (sort) {
         case LibrarySort::ReadingTime:
             return "b.reading_seconds DESC, b.title COLLATE NOCASE, b.path COLLATE NOCASE";
@@ -462,9 +565,36 @@ static const char* SortSql(LibrarySort sort) {
             return "b.last_read_ms DESC, b.title COLLATE NOCASE, b.path COLLATE NOCASE";
         case LibrarySort::Title:
             return "b.title COLLATE NOCASE, b.path COLLATE NOCASE";
+        case LibrarySort::Manual:
+            if (scope == LibraryBookScope::Collection) {
+                return "bc.sort_pos ASC, b.title COLLATE NOCASE, b.path COLLATE NOCASE";
+            }
+            if (scope == LibraryBookScope::ManualRoot) {
+                return "m.sort_pos ASC, b.title COLLATE NOCASE, b.path COLLATE NOCASE";
+            }
+            return "b.title COLLATE NOCASE, b.path COLLATE NOCASE";
         default:
             return "b.open_count DESC, b.title COLLATE NOCASE, b.path COLLATE NOCASE";
     }
+}
+
+static i64 NextSortPos(LibraryStore* store, i64 collectionId) {
+    sqlite3_stmt* stmt =
+        collectionId == 0 ? Prepare(store, "SELECT COALESCE(MAX(sort_pos), -1) + 1 FROM manual_books")
+                          : Prepare(store, "SELECT COALESCE(MAX(sort_pos), -1) + 1 FROM book_collections WHERE "
+                                           "collection_id=?1");
+    if (!stmt) {
+        return 0;
+    }
+    if (collectionId > 0) {
+        sqlite3_bind_int64(stmt, 1, collectionId);
+    }
+    i64 pos = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        pos = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return pos;
 }
 
 static Str EscapeLikePattern(Str filter) {
@@ -486,7 +616,17 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
         return books;
     }
     str::Builder sql;
-    sql.Append("SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms FROM books b ");
+    bool withSortPos = sort == LibrarySort::Manual &&
+                       (scope == LibraryBookScope::Collection || scope == LibraryBookScope::ManualRoot);
+    sql.Append(withSortPos ? "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,"
+                             : "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,0,");
+    if (withSortPos && scope == LibraryBookScope::Collection) {
+        sql.Append("bc.sort_pos,b.bg_color FROM books b ");
+    } else if (withSortPos && scope == LibraryBookScope::ManualRoot) {
+        sql.Append("m.sort_pos,b.bg_color FROM books b ");
+    } else {
+        sql.Append("b.bg_color FROM books b ");
+    }
     if (scope == LibraryBookScope::Desk) {
         sql.Append("JOIN desk_books d ON d.book_id=b.id ");
     } else if (scope == LibraryBookScope::Collection) {
@@ -505,7 +645,7 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
                        ? "AND (b.title LIKE ?2 ESCAPE '\\' OR b.path LIKE ?2 ESCAPE '\\') "
                        : "AND (b.title LIKE ?1 ESCAPE '\\' OR b.path LIKE ?1 ESCAPE '\\') ");
     }
-    sql.Append(fmt("ORDER BY %s", Str(SortSql(sort))));
+    sql.Append(fmt("ORDER BY %s", Str(SortSql(sort, scope))));
     sqlite3_stmt* stmt = Prepare(store, CStrTemp(ToStr(sql)));
     if (!stmt) {
         return books;
@@ -532,6 +672,17 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
             if (n != 0) return n;
             return ((*a)->id > (*b)->id) - ((*a)->id < (*b)->id);
         });
+    } else if (sort == LibrarySort::Manual) {
+        VecSort(books, [](LibraryBook* const* a, LibraryBook* const* b) -> int {
+            if ((*a)->sortPos != (*b)->sortPos) {
+                return ((*a)->sortPos > (*b)->sortPos) - ((*a)->sortPos < (*b)->sortPos);
+            }
+            int n = str::CmpNatural((*a)->title, (*b)->title);
+            if (n != 0) return n;
+            n = str::CmpNatural((*a)->path, (*b)->path);
+            if (n != 0) return n;
+            return ((*a)->id > (*b)->id) - ((*a)->id < (*b)->id);
+        });
     }
     return books;
 }
@@ -542,7 +693,7 @@ Vec<LibraryCollection*> LibraryStoreGetCollections(LibraryStore* store) {
         return collections;
     }
     sqlite3_stmt* stmt =
-        Prepare(store, "SELECT id,COALESCE(parent_id,0),kind,name FROM collections ORDER BY name COLLATE NOCASE,id");
+        Prepare(store, "SELECT id,COALESCE(parent_id,0),kind,name,bg_color FROM collections ORDER BY name COLLATE NOCASE,id");
     if (!stmt) {
         return collections;
     }
@@ -552,6 +703,7 @@ Vec<LibraryCollection*> LibraryStoreGetCollections(LibraryStore* store) {
         collection->parentId = sqlite3_column_int64(stmt, 1);
         collection->isShelf = sqlite3_column_int(stmt, 2) == 1;
         collection->name = ColumnTextDup(stmt, 3);
+        collection->bgColor = (u32)sqlite3_column_int64(stmt, 4);
         collections.Append(collection);
     }
     sqlite3_finalize(stmt);
@@ -622,13 +774,17 @@ WITH RECURSIVE subtree(id) AS (
   UNION ALL
   SELECT c.id FROM collections c JOIN subtree s ON c.parent_id=s.id
 )
-INSERT OR IGNORE INTO manual_books(book_id,added_ms)
-SELECT DISTINCT bc.book_id,?2
+INSERT OR IGNORE INTO manual_books(book_id,added_ms,sort_pos)
+SELECT DISTINCT bc.book_id,?2,
+  (SELECT COALESCE(MAX(m.sort_pos), -1) + 1 FROM manual_books m)
+  + ROW_NUMBER() OVER (ORDER BY bc.book_id)
+  - 1
 FROM book_collections bc JOIN subtree s ON s.id=bc.collection_id
 WHERE NOT EXISTS(
   SELECT 1 FROM book_collections other
   WHERE other.book_id=bc.book_id AND other.collection_id NOT IN (SELECT id FROM subtree)
-);
+)
+AND NOT EXISTS(SELECT 1 FROM manual_books m WHERE m.book_id=bc.book_id);
 )sql");
     if (!stmt) {
         Exec(store, "ROLLBACK");
@@ -720,12 +876,14 @@ UPDATE collections SET parent_id=?1,kind=CASE WHEN ?1 IS NULL THEN 1 ELSE 2 END 
 
 bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collectionId) {
     if (!LibraryStoreIsOpen(store)) return false;
-    sqlite3_stmt* stmt =
-        Prepare(store, "INSERT OR IGNORE INTO book_collections(book_id,collection_id,added_ms) VALUES(?1,?2,?3)");
+    i64 sortPos = NextSortPos(store, collectionId);
+    sqlite3_stmt* stmt = Prepare(
+        store, "INSERT OR IGNORE INTO book_collections(book_id,collection_id,added_ms,sort_pos) VALUES(?1,?2,?3,?4)");
     if (!stmt) return false;
     sqlite3_bind_int64(stmt, 1, bookId);
     sqlite3_bind_int64(stmt, 2, collectionId);
     sqlite3_bind_int64(stmt, 3, UnixTimeMsNow());
+    sqlite3_bind_int64(stmt, 4, sortPos);
     bool ok = sqlite3_step(stmt) == SQLITE_DONE;
     if (!ok) SetError(store, StrL("add book to collection"));
     sqlite3_finalize(stmt);
@@ -734,12 +892,12 @@ bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collec
 
 static sqlite3_stmt* PrepareBookMembership(LibraryStore* store, i64 collectionId, bool insert) {
     if (collectionId == 0) {
-        return Prepare(store, insert ? "INSERT OR IGNORE INTO manual_books(book_id,added_ms) VALUES(?1,?2)"
+        return Prepare(store, insert ? "INSERT OR IGNORE INTO manual_books(book_id,added_ms,sort_pos) VALUES(?1,?2,?3)"
                                      : "DELETE FROM manual_books WHERE book_id=?1");
     }
-    return Prepare(store,
-                   insert ? "INSERT OR IGNORE INTO book_collections(book_id,collection_id,added_ms) VALUES(?1,?2,?3)"
-                          : "DELETE FROM book_collections WHERE book_id=?1 AND collection_id=?2");
+    return Prepare(store, insert ? "INSERT OR IGNORE INTO book_collections(book_id,collection_id,added_ms,sort_pos) "
+                                   "VALUES(?1,?2,?3,?4)"
+                                 : "DELETE FROM book_collections WHERE book_id=?1 AND collection_id=?2");
 }
 
 bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollectionId, i64 targetCollectionId, bool copy) {
@@ -765,15 +923,18 @@ bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollection
         return false;
     }
 
+    i64 sortPos = NextSortPos(store, targetCollectionId);
     sqlite3_stmt* target = PrepareBookMembership(store, targetCollectionId, true);
     bool ok = target != nullptr;
     if (target) {
         sqlite3_bind_int64(target, 1, bookId);
         if (targetCollectionId == 0) {
             sqlite3_bind_int64(target, 2, UnixTimeMsNow());
+            sqlite3_bind_int64(target, 3, sortPos);
         } else {
             sqlite3_bind_int64(target, 2, targetCollectionId);
             sqlite3_bind_int64(target, 3, UnixTimeMsNow());
+            sqlite3_bind_int64(target, 4, sortPos);
         }
         ok = sqlite3_step(target) == SQLITE_DONE;
         if (!ok) SetError(store, StrL("copy book membership"));
@@ -797,6 +958,73 @@ bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollection
     return true;
 }
 
+bool LibraryStoreReorderBook(LibraryStore* store, i64 bookId, i64 collectionId, i64 targetBookId, bool insertAfter) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0 || targetBookId <= 0 || bookId == targetBookId || collectionId < 0) {
+        return false;
+    }
+    LibraryBookScope scope = collectionId == 0 ? LibraryBookScope::ManualRoot : LibraryBookScope::Collection;
+    Vec<LibraryBook*> books = LibraryStoreGetBooks(store, scope, collectionId, LibrarySort::Manual, Str());
+    int sourceIdx = -1;
+    int targetIdx = -1;
+    for (int i = 0; i < len(books); i++) {
+        if (books[i]->id == bookId) {
+            sourceIdx = i;
+        }
+        if (books[i]->id == targetBookId) {
+            targetIdx = i;
+        }
+    }
+    if (sourceIdx < 0 || targetIdx < 0) {
+        DeleteLibraryBooks(books);
+        return false;
+    }
+    LibraryBook* moving = books[sourceIdx];
+    books.RemoveAt(sourceIdx);
+    if (sourceIdx < targetIdx) {
+        targetIdx--;
+    }
+    int insertIdx = insertAfter ? targetIdx + 1 : targetIdx;
+    if (insertIdx < 0) {
+        insertIdx = 0;
+    }
+    if (insertIdx > len(books)) {
+        insertIdx = len(books);
+    }
+    books.InsertAt(insertIdx, moving);
+
+    if (!Exec(store, "BEGIN IMMEDIATE")) {
+        DeleteLibraryBooks(books);
+        return false;
+    }
+    const char* sql = collectionId == 0 ? "UPDATE manual_books SET sort_pos=?1 WHERE book_id=?2"
+                                        : "UPDATE book_collections SET sort_pos=?1 WHERE book_id=?2 AND collection_id=?3";
+    sqlite3_stmt* stmt = Prepare(store, sql);
+    bool ok = stmt != nullptr;
+    for (int i = 0; ok && i < len(books); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_int64(stmt, 1, i);
+        sqlite3_bind_int64(stmt, 2, books[i]->id);
+        if (collectionId > 0) {
+            sqlite3_bind_int64(stmt, 3, collectionId);
+        }
+        ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+        if (!ok) {
+            SetError(store, StrL("reorder book"));
+        }
+    }
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (!ok || !Exec(store, "COMMIT")) {
+        Exec(store, "ROLLBACK");
+        DeleteLibraryBooks(books);
+        return false;
+    }
+    DeleteLibraryBooks(books);
+    return true;
+}
+
 bool LibraryStoreSetBookOnDesk(LibraryStore* store, i64 bookId, bool onDesk) {
     if (!LibraryStoreIsOpen(store)) return false;
     const char* sql = onDesk ? "INSERT OR IGNORE INTO desk_books(book_id,added_ms) VALUES(?1,?2)"
@@ -817,6 +1045,43 @@ bool LibraryStoreRemoveBook(LibraryStore* store, i64 bookId) {
     if (!stmt) return false;
     sqlite3_bind_int64(stmt, 1, bookId);
     bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool LibraryStoreSetBookBgColor(LibraryStore* store, i64 bookId, u32 bgColor) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0) {
+        return false;
+    }
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE books SET bg_color=?1,updated_ms=?2 WHERE id=?3");
+    if (!stmt) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, 1, (i64)bgColor);
+    sqlite3_bind_int64(stmt, 2, UnixTimeMsNow());
+    sqlite3_bind_int64(stmt, 3, bookId);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    if (!ok) {
+        SetError(store, StrL("set book background color"));
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool LibraryStoreSetCollectionBgColor(LibraryStore* store, i64 collectionId, u32 bgColor) {
+    if (!LibraryStoreIsOpen(store) || collectionId <= 0) {
+        return false;
+    }
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE collections SET bg_color=?1 WHERE id=?2");
+    if (!stmt) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, 1, (i64)bgColor);
+    sqlite3_bind_int64(stmt, 2, collectionId);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    if (!ok) {
+        SetError(store, StrL("set collection background color"));
+    }
     sqlite3_finalize(stmt);
     return ok;
 }
@@ -939,6 +1204,49 @@ static void TestLibraryNaturalTitleSort() {
     Vec<LibraryBook*> books = LibraryStoreGetBooks(store, LibraryBookScope::All, 0, LibrarySort::Title, Str());
     AssertBookPaths(books, "C:\\Sort\\C.pdf", "C:\\Sort\\B.pdf", "C:\\Sort\\A.pdf");
 
+    LibraryStoreClose(store);
+    utassert(file::Delete(dbPath));
+}
+
+static void TestLibraryManualReorder() {
+    TempStr dir = path::JoinTemp(GetTempDirTemp(), StrL("sumatra-library-test"));
+    TempStr dbPath = path::JoinTemp(dir, fmt("reorder-%lld.db", UnixTimeMsNow()));
+    LibraryStore* store = LibraryStoreOpen(dbPath);
+    utassert(LibraryStoreIsOpen(store));
+
+    LibraryBook* a = LibraryStoreAddBook(store, StrL("C:\\Reorder\\A.pdf"), StrL("A"), 100);
+    LibraryBook* b = LibraryStoreAddBook(store, StrL("C:\\Reorder\\B.pdf"), StrL("B"), 100);
+    LibraryBook* c = LibraryStoreAddBook(store, StrL("C:\\Reorder\\C.pdf"), StrL("C"), 100);
+    utassert(a && b && c);
+    i64 idA = a->id, idB = b->id, idC = c->id;
+    DeleteLibraryBook(a);
+    DeleteLibraryBook(b);
+    DeleteLibraryBook(c);
+
+    Vec<LibraryBook*> books = LibraryStoreGetBooks(store, LibraryBookScope::ManualRoot, 0, LibrarySort::Manual, Str());
+    AssertBookPaths(books, "C:\\Reorder\\A.pdf", "C:\\Reorder\\B.pdf", "C:\\Reorder\\C.pdf");
+
+    utassert(LibraryStoreReorderBook(store, idC, 0, idA, false));
+    books = LibraryStoreGetBooks(store, LibraryBookScope::ManualRoot, 0, LibrarySort::Manual, Str());
+    AssertBookPaths(books, "C:\\Reorder\\C.pdf", "C:\\Reorder\\A.pdf", "C:\\Reorder\\B.pdf");
+
+    utassert(LibraryStoreReorderBook(store, idA, 0, idB, true));
+    books = LibraryStoreGetBooks(store, LibraryBookScope::ManualRoot, 0, LibrarySort::Manual, Str());
+    AssertBookPaths(books, "C:\\Reorder\\C.pdf", "C:\\Reorder\\B.pdf", "C:\\Reorder\\A.pdf");
+
+    LibraryCollection* shelf = LibraryStoreCreateCollection(store, 0, true, StrL("Shelf"));
+    LibraryCollection* cat = LibraryStoreCreateCollection(store, shelf->id, false, StrL("Cat"));
+    utassert(LibraryStorePlaceBook(store, idA, 0, cat->id, false));
+    utassert(LibraryStorePlaceBook(store, idB, 0, cat->id, false));
+    utassert(LibraryStorePlaceBook(store, idC, 0, cat->id, false));
+    books = LibraryStoreGetBooks(store, LibraryBookScope::Collection, cat->id, LibrarySort::Manual, Str());
+    AssertBookPaths(books, "C:\\Reorder\\A.pdf", "C:\\Reorder\\B.pdf", "C:\\Reorder\\C.pdf");
+    utassert(LibraryStoreReorderBook(store, idB, cat->id, idC, true));
+    books = LibraryStoreGetBooks(store, LibraryBookScope::Collection, cat->id, LibrarySort::Manual, Str());
+    AssertBookPaths(books, "C:\\Reorder\\A.pdf", "C:\\Reorder\\C.pdf", "C:\\Reorder\\B.pdf");
+
+    DeleteLibraryCollection(cat);
+    DeleteLibraryCollection(shelf);
     LibraryStoreClose(store);
     utassert(file::Delete(dbPath));
 }
@@ -1127,6 +1435,7 @@ void LibraryStore_UnitTests() {
     utassert(file::Delete(dbPath));
     TestLibraryStableSorts();
     TestLibraryNaturalTitleSort();
+    TestLibraryManualReorder();
     TestLibraryPathReplaceAndPersistence();
 }
 #endif

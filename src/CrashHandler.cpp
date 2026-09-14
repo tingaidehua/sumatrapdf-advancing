@@ -27,6 +27,11 @@
 #include "SumatraConfig.h"
 #include "AppSettings.h"
 #include "SumatraLog.h"
+#include "base/DirScan.h"
+
+// from SumatraPDF.cpp — durable crash report directory under app-data / OneDrive
+TempStr GetCrashReportsDirTemp();
+void PruneCrashReports();
 
 // logf() is a template that formats with fmt() and routes through log(), so it
 // keeps logging (to at least the debugger) even when gReducedLogging is set.
@@ -278,6 +283,85 @@ static void SaveCrashInfo(Str d) {
     logf("SaveCrashInfo: gCrashFilePath='%s'\n", gCrashFilePath);
     dir::CreateForFile(gCrashFilePath);
     file::WriteFile(gCrashFilePath, d);
+
+    // Also keep a timestamped archive so a later crash does not erase evidence
+    // needed for debugging. PruneCrashReports() caps growth.
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    TempStr stamp = fmt("crash-%04d%02d%02d-%02d%02d%02d.txt", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                        st.wSecond);
+    TempStr dir = path::GetDirTemp(gCrashFilePath);
+    if (dir) {
+        TempStr archived = path::JoinTemp(dir, stamp);
+        if (archived && !str::EqI(archived, gCrashFilePath)) {
+            file::WriteFile(archived, d);
+        }
+        if (gCrashDumpPath && file::Exists(gCrashDumpPath)) {
+            TempStr dumpStamp = fmt("crash-%04d%02d%02d-%02d%02d%02d.dmp", st.wYear, st.wMonth, st.wDay, st.wHour,
+                                    st.wMinute, st.wSecond);
+            TempStr dumpArchived = path::JoinTemp(dir, dumpStamp);
+            if (dumpArchived) {
+                file::Copy(dumpArchived, gCrashDumpPath, false);
+            }
+        }
+    }
+    PruneCrashReports();
+}
+
+struct CrashReportFile {
+    Str path;
+    FILETIME ft{};
+};
+
+static int CmpCrashReportNewestFirst(const CrashReportFile* a, const CrashReportFile* b) {
+    return -CompareFileTime(&a->ft, &b->ft); // newest first
+}
+
+// Keep crash evidence durable but bounded: many txts are cheap; dumps are not.
+void PruneCrashReports() {
+    TempStr dir = GetCrashReportsDirTemp();
+    if (!dir || !dir::Exists(dir)) {
+        return;
+    }
+    constexpr int kKeepCrashTxt = 20;
+    constexpr int kKeepCrashDmp = 3;
+    Vec<CrashReportFile> txts;
+    Vec<CrashReportFile> dmps;
+    DirIter iter(dir);
+    iter.includeFiles = true;
+    iter.includeDirs = false;
+    for (DirIterEntry* e : iter) {
+        if (!e->name) {
+            continue;
+        }
+        if (str::EqI(e->name, StrL("sumatrapdfcrash.txt")) || str::EqI(e->name, StrL("sumatrapdfcrash.dmp"))) {
+            continue; // always keep the "latest" names
+        }
+        CrashReportFile rec{str::Dup(e->filePath), e->modificationTime};
+        if (str::StartsWithI(e->name, StrL("crash-")) && str::EndsWithI(e->name, StrL(".txt"))) {
+            txts.Append(rec);
+        } else if (str::StartsWithI(e->name, StrL("crash-")) && str::EndsWithI(e->name, StrL(".dmp"))) {
+            dmps.Append(rec);
+        } else {
+            str::Free(rec.path);
+        }
+    }
+    VecSort(txts, CmpCrashReportNewestFirst);
+    VecSort(dmps, CmpCrashReportNewestFirst);
+    for (int i = kKeepCrashTxt; i < len(txts); i++) {
+        logf("PruneCrashReports: deleting '%s'\n", txts[i].path);
+        file::Delete(txts[i].path);
+    }
+    for (int i = kKeepCrashDmp; i < len(dmps); i++) {
+        logf("PruneCrashReports: deleting '%s'\n", dmps[i].path);
+        file::Delete(dmps[i].path);
+    }
+    for (CrashReportFile& rec : txts) {
+        str::Free(rec.path);
+    }
+    for (CrashReportFile& rec : dmps) {
+        str::Free(rec.path);
+    }
 }
 
 static void WriteCrashInfoToStdErr(Str d) {

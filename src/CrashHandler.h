@@ -10,3 +10,4 @@ bool CrashHandlerDownloadSymbols();
 bool AreSymbolsDownloaded(Str symDir);
 bool InitializeDbgHelp(bool force);
 bool SetSymbolsDir(Str symDir);
+void PruneCrashReports();

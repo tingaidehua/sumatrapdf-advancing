@@ -244,6 +244,7 @@ struct MainWindow {
     uintptr_t libraryDropItem = 0;
     Point libraryDragStart;
     bool libraryDragging = false;
+    bool libraryDropAfter = false;
     Vec<i64> expandedLibraryCollections;
     bool libraryExpansionInitialized = false;
     bool libraryModelFiltered = false;

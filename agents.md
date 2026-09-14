@@ -28,6 +28,27 @@ To debug run: `windbgx -Q -o -g ./out/dbg64/SumatraPDF.exe`
 
 When launching SumatraPDF.exe for ad-hoc testing, always pass the `-for-testing` cmd-line flag. It starts a new instance (won't interfere with an already running SumatraPDF), doesn't restore the previous session (only loads files given on the cmd-line) and doesn't save settings (won't overwrite the settings of the user).
 
+## Shared app data / logs / crash reports (this fork)
+
+Settings, library DB, and session logs live in a **stable synced root** so every EXE
+(`out/dbg64`, `out/rel64`, …) and every machine with the same OneDrive folder share state:
+
+| What | Path |
+|------|------|
+| Settings + library | `%OneDrive%\SumatraPDF\` (`SumatraPDF-settings.txt`, `SumatraPDF-library.db`) |
+| Session logs | `%OneDrive%\SumatraPDF\SumatraPDF.log` (release default) or `sumlog.txt` (debug default). These are **truncated each launch** — fine for a current-session probe, not a crash archive. |
+| **Crash reports (always look here first)** | `%OneDrive%\SumatraPDF\crashes\` — `sumatrapdfcrash.txt` / `.dmp` (latest) plus timestamped `crash-YYYYMMDD-HHMMSS.txt` / `.dmp` archives |
+| Extracted DLLs / symbols / build scratch | `%LOCALAPPDATA%\SumatraPDF\SumatraPDF-data\<exe-sha1-prefix>\` — **do not sync**; Clear History may wipe it |
+
+Override with `-appdata <dir>` if needed. If `%OneDrive%` is missing, the app falls back to a portable beside-EXE folder.
+
+### AI agent crash / hang workflow
+
+1. **Before debugging a crash or hang**, open the newest files under `%OneDrive%\SumatraPDF\crashes\` (and skim the current session log in `%OneDrive%\SumatraPDF\` if useful). Prefer the timestamped `crash-*.txt` over guessing from memory.
+2. **Crash reports must stay until the bug is fixed.** Do not delete them as a “cleanup” step mid-investigation. The runtime already prunes archives (keeps ~20 `.txt` and ~3 `.dmp` plus the latest `sumatrapdfcrash.*`) to avoid log explosion — do not disable that.
+3. **After the fix is verified**, delete the crash files that belonged to that bug (and any obsolete ones you used), then append a short entry to `docs/ai/crash-fix.md` (date, symptom, root cause, fix / files touched). Keep entries terse; this is operational memory for later agents, not a changelog.
+4. **Avoid log explosion:** never commit `.dmp` / crash dumps or `SumatraPDF-data` into git; do not copy extracted DLL trees into OneDrive; do not invent new unbounded log files. Prefer one timestamped crash archive over continuous append-only debug logs.
+
 After making a change to a .cpp, .c or .h file under `src/` (and before running build.ts), run clang-format on those files to reformat them in place. Do **not** clang-format third-party / vendored code (`ext/`, etc.) — keep edits there minimal and match the existing local style.
 
 After changing a .ts file under `cmd/` or `tests/`, run `bun cmd/format.ts` — it runs prettier over `cmd/**/*.ts` and `tests/**/*.ts` and then clang-formats the C/C++ sources. Use `bun cmd/format.ts -ts` to run only the prettier pass (no Visual Studio / clang-format needed). Prettier settings live in `.prettierrc.json` (`printWidth` 120, `endOfLine` lf) and `.prettierignore` (vendored code, build output, scratch `tmp/` dirs, and the generated `docs/md/Advanced-options-settings.md`). For other prettier-owned files (.js / .json / .md) run `bunx prettier --write <files>` on the files you touched.

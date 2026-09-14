@@ -37,9 +37,11 @@ cmd/tmp/
 !resources/translations.txt
 /SumatraPDF.exe
 /SumatraPDF/
+/SumatraPDF.local-bak/
 /output/
 log.txt
 sumlog.txt
+*.dmp
 vs2022/enc_temp_folder
 docs/md/.obsidian
 

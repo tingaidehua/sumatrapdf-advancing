@@ -72,15 +72,38 @@ void SetAppDataDir(Str dir) {
     gAppDataDir = str::Dup(GetPermArena(), dir);
 }
 
+TempStr GetOneDriveAppDataDirTemp() {
+    // Prefer the OneDrive env var so Personal / Business renames still resolve.
+    TempStr oneDrive = GetEnvVariableTemp(StrL("OneDrive"));
+    if (!oneDrive) {
+        TempStr profile = GetSpecialFolderTemp(CSIDL_PROFILE, false);
+        if (profile) {
+            oneDrive = path::JoinTemp(profile, StrL("OneDrive"));
+        }
+    }
+    if (!oneDrive || !dir::Exists(oneDrive)) {
+        return {};
+    }
+    TempStr dir = path::JoinTemp(oneDrive, StrL("SumatraPDF"));
+    if (!dir::HasWriteAccess(dir) && !dir::CreateAll(dir)) {
+        logf("GetOneDriveAppDataDirTemp: cannot use '%s'\n", dir);
+        return {};
+    }
+    if (!dir::HasWriteAccess(dir)) {
+        return {};
+    }
+    return dir;
+}
+
 TempStr GetAppDataDirTemp() {
     if (gAppDataDir) {
         return gAppDataDir.s;
     }
-    // The shipped build is always relocatable; do not consult installation
-    // detection or registry state when choosing its writable data root.
+    // Prefer a synced OneDrive\SumatraPDF root so dbg/rel builds and machines
+    // that share the same OneDrive folder keep one settings/library tree.
+    TempStr dir = GetOneDriveAppDataDirTemp();
     bool isPortable = true;
-    TempStr dir = nullptr;
-    if (isPortable) {
+    if (!dir) {
         // Portable distributions keep all mutable state beside the executable
         // in a folder named after it. Moving the EXE together with this folder
         // therefore preserves settings, cache, database, logs and WebView data.

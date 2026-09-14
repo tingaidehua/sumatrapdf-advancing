@@ -28,6 +28,8 @@ struct TextEditor {
 bool IsRunningInPortableMode();
 bool IsDllBuild();
 bool IsInstallerOrUninstallerExe();
+// Shared settings/library root: %OneDrive%\SumatraPDF when OneDrive is available.
+TempStr GetOneDriveAppDataDirTemp();
 
 void DeleteAppTools();
 

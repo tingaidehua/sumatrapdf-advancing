@@ -8,6 +8,7 @@ enum class LibrarySort {
     ReadingTime,
     Recent,
     Title,
+    Manual,
 };
 
 enum class LibraryBookScope {
@@ -25,6 +26,8 @@ struct LibraryBook {
     i64 openCount = 0;
     i64 readingSeconds = 0;
     i64 lastReadMs = 0;
+    i64 sortPos = 0;
+    u32 bgColor = 0; // 0 = none, else 0x00RRGGBB
 };
 
 struct LibraryCollection {
@@ -32,6 +35,7 @@ struct LibraryCollection {
     i64 parentId = 0;
     bool isShelf = false;
     Str name;
+    u32 bgColor = 0; // 0 = none, else 0x00RRGGBB
 };
 
 struct LibraryPathChange {
@@ -62,8 +66,13 @@ bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collec
 // Collection id 0 denotes the visible Library root. A move removes the source
 // membership; a copy preserves it and adds the destination membership.
 bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollectionId, i64 targetCollectionId, bool copy);
+// Reorder a book among siblings in collectionId (0 = library root). Places
+// bookId immediately before or after targetBookId and renumbers sort_pos.
+bool LibraryStoreReorderBook(LibraryStore* store, i64 bookId, i64 collectionId, i64 targetBookId, bool insertAfter);
 bool LibraryStoreSetBookOnDesk(LibraryStore* store, i64 bookId, bool onDesk);
 bool LibraryStoreRemoveBook(LibraryStore* store, i64 bookId);
+bool LibraryStoreSetBookBgColor(LibraryStore* store, i64 bookId, u32 bgColor);
+bool LibraryStoreSetCollectionBgColor(LibraryStore* store, i64 collectionId, u32 bgColor);
 
 Vec<LibraryPathChange*> LibraryStorePreviewPathReplace(LibraryStore* store, Str oldPrefix, Str newPrefix);
 bool LibraryStoreApplyPathReplace(LibraryStore* store, Vec<LibraryPathChange*>& changes);

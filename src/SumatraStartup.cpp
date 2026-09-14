@@ -2123,11 +2123,14 @@ static void InstallSumatraCrashHandler(bool localOnly) {
         return;
     }
 
-    TempStr crashInfoDir = GetCrashInfoDirTemp();
-    TempStr crashDumpPath = path::JoinTemp(crashInfoDir, StrL("sumatrapdfcrash.dmp"));
-    TempStr crashFilePath = path::JoinTemp(crashInfoDir, StrL("sumatrapdfcrash.txt"));
-    TempStr symDir = localOnly ? GetSelfExeDirTemp() : crashInfoDir;
+    TempStr reportsDir = GetCrashReportsDirTemp();
+    TempStr crashDumpPath = path::JoinTemp(reportsDir, StrL("sumatrapdfcrash.dmp"));
+    TempStr crashFilePath = path::JoinTemp(reportsDir, StrL("sumatrapdfcrash.txt"));
+    // Keep downloaded PDB packages beside the EXE hash, not in the synced
+    // crashes/ tree (they are large and Clear History may wipe them).
+    TempStr symDir = localOnly ? GetSelfExeDirTemp() : GetSumatraBuildSpecificDirTemp();
     InstallCrashHandler(crashDumpPath, crashFilePath, symDir, localOnly);
+    PruneCrashReports();
 }
 
 int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevInstance*/, _In_ LPSTR /*lpCmdLine*/,
@@ -2480,12 +2483,17 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     // TODO: for reasons I don't understand, this must be called before LoadSettings()
     DarkModeInit();
 
-    // This build is distributed as a relocatable portable pair: the EXE and a
-    // same-name data directory beside it. Establish that root before settings,
-    // logging, WebView and Library initialization can choose a path.
+    // Prefer %OneDrive%\SumatraPDF so every EXE (dbg/rel/workspace) and every
+    // machine that syncs the same OneDrive folder shares settings + library.
+    // Fall back to the portable beside-EXE directory when OneDrive is absent.
     if (!flags.appdataDir) {
-        TempStr exeBase = path::GetBaseNameTemp(GetSelfExePathTemp());
-        SetAppDataDir(path::JoinTemp(GetSelfExeDirTemp(), path::GetPathNoExtTemp(exeBase)));
+        TempStr shared = GetOneDriveAppDataDirTemp();
+        if (shared) {
+            SetAppDataDir(shared);
+        } else {
+            TempStr exeBase = path::GetBaseNameTemp(GetSelfExePathTemp());
+            SetAppDataDir(path::JoinTemp(GetSelfExeDirTemp(), path::GetPathNoExtTemp(exeBase)));
+        }
     }
 
     LoadSettings();
