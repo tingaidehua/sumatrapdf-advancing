@@ -78,6 +78,11 @@ static LibraryBook* ReadBook(sqlite3_stmt* stmt) {
     book->sortPos = sqlite3_column_count(stmt) > 6 ? sqlite3_column_int64(stmt, 6) : 0;
     book->bgColor = sqlite3_column_count(stmt) > 7 ? (u32)sqlite3_column_int64(stmt, 7) : 0;
     book->notebooklm = sqlite3_column_count(stmt) > 8 ? ColumnTextDup(stmt, 8) : Str{};
+    if (sqlite3_column_count(stmt) > 9) {
+        int k = sqlite3_column_int(stmt, 9);
+        book->kind = k == (int)LibraryBookKind::Web ? LibraryBookKind::Web : LibraryBookKind::Pdf;
+    }
+    book->url = sqlite3_column_count(stmt) > 10 ? ColumnTextDup(stmt, 10) : Str{};
     return book;
 }
 
@@ -87,6 +92,7 @@ void DeleteLibraryBook(LibraryBook* book) {
     }
     str::Free(book->path);
     str::Free(book->title);
+    str::Free(book->url);
     str::Free(book->notebooklm);
     delete book;
 }
@@ -143,7 +149,9 @@ CREATE TABLE IF NOT EXISTS books (
   created_ms INTEGER NOT NULL,
   updated_ms INTEGER NOT NULL,
   bg_color INTEGER NOT NULL DEFAULT 0,
-  notebooklm TEXT NOT NULL DEFAULT ''
+  notebooklm TEXT NOT NULL DEFAULT '',
+  kind INTEGER NOT NULL DEFAULT 0 CHECK(kind IN (0, 1)),
+  url TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS collections (
   id INTEGER PRIMARY KEY,
@@ -174,7 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
 CREATE INDEX IF NOT EXISTS idx_book_collections_collection ON book_collections(collection_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_parent_name
   ON collections(COALESCE(parent_id, 0), name COLLATE NOCASE);
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 )sql";
     return Exec(store, sql);
@@ -268,6 +276,20 @@ static bool MigrateToV6(LibraryStore* store) {
     return Exec(store, "PRAGMA user_version = 6");
 }
 
+static bool MigrateToV7(LibraryStore* store) {
+    if (!TableHasColumn(store, "books", "kind")) {
+        if (!Exec(store, "ALTER TABLE books ADD COLUMN kind INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+    }
+    if (!TableHasColumn(store, "books", "url")) {
+        if (!Exec(store, "ALTER TABLE books ADD COLUMN url TEXT NOT NULL DEFAULT ''")) {
+            return false;
+        }
+    }
+    return Exec(store, "PRAGMA user_version = 7");
+}
+
 static int SchemaVersion(LibraryStore* store) {
     sqlite3_stmt* stmt = Prepare(store, "PRAGMA user_version");
     if (!stmt) {
@@ -301,14 +323,14 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     int version = SchemaVersion(store);
-    if (version < 0 || version > 6) {
+    if (version < 0 || version > 7) {
         str::ReplaceWithCopy(&store->error, fmt("unsupported library database version: %d", version));
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
     }
-    if (version < 6) {
-        logf("LibraryStore migrating schema: v%d -> v6\n", version);
+    if (version < 7) {
+        logf("LibraryStore migrating schema: v%d -> v7\n", version);
     }
     if (!CreateSchema(store)) {
         sqlite3_close(store->db);
@@ -328,6 +350,11 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     if (!MigrateToV6(store)) {
+        sqlite3_close(store->db);
+        store->db = nullptr;
+        return store;
+    }
+    if (!MigrateToV7(store)) {
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
@@ -401,7 +428,7 @@ VALUES(?1, ?2, ?3, 1, 0, ?4, ?4, ?4)
 ON CONFLICT(path_key) DO UPDATE SET
   path=excluded.path, title=excluded.title, open_count=books.open_count+1,
   last_read_ms=excluded.last_read_ms, updated_ms=excluded.updated_ms
-RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
+RETURNING id, path, title, open_count, reading_seconds, last_read_ms, 0, bg_color, notebooklm, kind, url;
 )sql";
     sqlite3_stmt* stmt = Prepare(store, sql);
     if (!stmt) {
@@ -466,7 +493,7 @@ LibraryBook* LibraryStoreAddBook(LibraryStore* store, Str path, Str title, i64 n
 INSERT INTO books(path, path_key, title, open_count, reading_seconds, last_read_ms, created_ms, updated_ms)
 VALUES(?1, ?2, ?3, 0, 0, 0, ?4, ?4)
 ON CONFLICT(path_key) DO UPDATE SET path=excluded.path,title=excluded.title,updated_ms=excluded.updated_ms
-RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
+RETURNING id, path, title, open_count, reading_seconds, last_read_ms, 0, bg_color, notebooklm, kind, url;
 )sql";
     sqlite3_stmt* stmt = Prepare(store, sql);
     if (!stmt) {
@@ -528,7 +555,7 @@ INSERT INTO books(path, path_key, title, open_count, reading_seconds, last_read_
 VALUES(?1, ?2, ?3, ?4, 0, 0, ?5, ?5)
 ON CONFLICT(path_key) DO UPDATE SET
   path=excluded.path, open_count=MAX(books.open_count, excluded.open_count), updated_ms=excluded.updated_ms
-RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
+RETURNING id, path, title, open_count, reading_seconds, last_read_ms, 0, bg_color, notebooklm, kind, url;
 )sql";
     sqlite3_stmt* stmt = Prepare(store, sql);
     if (!stmt) {
@@ -551,13 +578,102 @@ RETURNING id, path, title, open_count, reading_seconds, last_read_ms;
     return book;
 }
 
+LibraryBook* LibraryStoreAddWebBook(LibraryStore* store, Str url, Str title, i64 nowMs) {
+    if (!LibraryStoreIsOpen(store) || !url || url.len == 0) {
+        return nullptr;
+    }
+    TempStr trimmedUrl = str::DupTemp(url);
+    if (!title || title.len == 0) {
+        // Full URL until the browser document.title arrives (library always follows tab title).
+        title = trimmedUrl;
+    }
+    if (!Exec(store, "BEGIN IMMEDIATE")) {
+        return nullptr;
+    }
+    // Temporary unique path until we know the row id for web://{id}.
+    TempStr pendingPath = fmt("web://pending-%lld", nowMs);
+    Str pendingKey = PathKey(pendingPath);
+    const char* sql = R"sql(
+INSERT INTO books(path, path_key, title, open_count, reading_seconds, last_read_ms, created_ms, updated_ms, kind, url)
+VALUES(?1, ?2, ?3, 0, 0, 0, ?4, ?4, 1, ?5)
+RETURNING id, path, title, open_count, reading_seconds, last_read_ms, 0, bg_color, notebooklm, kind, url;
+)sql";
+    sqlite3_stmt* stmt = Prepare(store, sql);
+    if (!stmt) {
+        Exec(store, "ROLLBACK");
+        str::Free(pendingKey);
+        return nullptr;
+    }
+    BindText(stmt, 1, pendingPath);
+    BindText(stmt, 2, pendingKey);
+    BindText(stmt, 3, title);
+    sqlite3_bind_int64(stmt, 4, nowMs);
+    BindText(stmt, 5, trimmedUrl);
+    LibraryBook* book = nullptr;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        book = ReadBook(stmt);
+    } else {
+        SetError(store, StrL("add web book"));
+    }
+    sqlite3_finalize(stmt);
+    str::Free(pendingKey);
+    if (book) {
+        TempStr finalPath = fmt("web://%lld", book->id);
+        Str finalKey = PathKey(finalPath);
+        stmt = Prepare(store, "UPDATE books SET path=?1,path_key=?2,updated_ms=?3 WHERE id=?4");
+        bool pathOk = stmt != nullptr;
+        if (pathOk) {
+            BindText(stmt, 1, finalPath);
+            BindText(stmt, 2, finalKey);
+            sqlite3_bind_int64(stmt, 3, nowMs);
+            sqlite3_bind_int64(stmt, 4, book->id);
+            pathOk = sqlite3_step(stmt) == SQLITE_DONE;
+            sqlite3_finalize(stmt);
+        }
+        str::Free(finalKey);
+        if (!pathOk) {
+            SetError(store, StrL("finalize web book path"));
+            DeleteLibraryBook(book);
+            book = nullptr;
+        } else {
+            str::Free(book->path);
+            book->path = str::Dup(finalPath);
+            i64 sortPos = NextSortPos(store, 0);
+            stmt = Prepare(store, "INSERT OR IGNORE INTO manual_books(book_id,added_ms,sort_pos) VALUES(?1,?2,?3)");
+            if (stmt) {
+                sqlite3_bind_int64(stmt, 1, book->id);
+                sqlite3_bind_int64(stmt, 2, nowMs);
+                sqlite3_bind_int64(stmt, 3, sortPos);
+                if (sqlite3_step(stmt) != SQLITE_DONE) {
+                    SetError(store, StrL("mark web book at root"));
+                    DeleteLibraryBook(book);
+                    book = nullptr;
+                }
+                sqlite3_finalize(stmt);
+            } else {
+                DeleteLibraryBook(book);
+                book = nullptr;
+            }
+        }
+    }
+    if (!book || !Exec(store, "COMMIT")) {
+        Exec(store, "ROLLBACK");
+        DeleteLibraryBook(book);
+        book = nullptr;
+    }
+    return book;
+}
+
 bool LibraryStoreAddReadingTime(LibraryStore* store, Str path, i64 seconds, i64 nowMs) {
     if (!LibraryStoreIsOpen(store) || seconds <= 0) {
         return false;
     }
     Str key = PathKey(path);
+    // Skip web books: reading tracker is PDF-only.
     sqlite3_stmt* stmt = Prepare(
-        store, "UPDATE books SET reading_seconds=reading_seconds+?1,last_read_ms=?2,updated_ms=?2 WHERE path_key=?3");
+        store,
+        "UPDATE books SET reading_seconds=reading_seconds+?1,last_read_ms=?2,updated_ms=?2 "
+        "WHERE path_key=?3 AND kind=0");
     if (!stmt) {
         str::Free(key);
         return false;
@@ -638,11 +754,11 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
     sql.Append(withSortPos ? "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,"
                              : "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,0,");
     if (withSortPos && scope == LibraryBookScope::Collection) {
-        sql.Append("bc.sort_pos,b.bg_color,b.notebooklm FROM books b ");
+        sql.Append("bc.sort_pos,b.bg_color,b.notebooklm,b.kind,b.url FROM books b ");
     } else if (withSortPos && scope == LibraryBookScope::ManualRoot) {
-        sql.Append("m.sort_pos,b.bg_color,b.notebooklm FROM books b ");
+        sql.Append("m.sort_pos,b.bg_color,b.notebooklm,b.kind,b.url FROM books b ");
     } else {
-        sql.Append("b.bg_color,b.notebooklm FROM books b ");
+        sql.Append("b.bg_color,b.notebooklm,b.kind,b.url FROM books b ");
     }
     if (scope == LibraryBookScope::Desk) {
         sql.Append("JOIN desk_books d ON d.book_id=b.id ");
@@ -659,8 +775,8 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
     }
     if (filter) {
         sql.Append(scope == LibraryBookScope::Collection
-                       ? "AND (b.title LIKE ?2 ESCAPE '\\' OR b.path LIKE ?2 ESCAPE '\\') "
-                       : "AND (b.title LIKE ?1 ESCAPE '\\' OR b.path LIKE ?1 ESCAPE '\\') ");
+                       ? "AND (b.title LIKE ?2 ESCAPE '\\' OR b.path LIKE ?2 ESCAPE '\\' OR b.url LIKE ?2 ESCAPE '\\') "
+                       : "AND (b.title LIKE ?1 ESCAPE '\\' OR b.path LIKE ?1 ESCAPE '\\' OR b.url LIKE ?1 ESCAPE '\\') ");
     }
     sql.Append(fmt("ORDER BY %s", Str(SortSql(sort, scope))));
     sqlite3_stmt* stmt = Prepare(store, CStrTemp(ToStr(sql)));
@@ -1160,7 +1276,7 @@ LibraryBook* LibraryStoreFindBookByPath(LibraryStore* store, Str path) {
     }
     Str key = PathKey(NormalizePathTemp(path));
     sqlite3_stmt* stmt =
-        Prepare(store, "SELECT id,path,title,open_count,reading_seconds,last_read_ms,0,bg_color,notebooklm "
+        Prepare(store, "SELECT id,path,title,open_count,reading_seconds,last_read_ms,0,bg_color,notebooklm,kind,url "
                        "FROM books WHERE path_key=?1");
     if (!stmt) {
         str::Free(key);
@@ -1181,7 +1297,7 @@ LibraryBook* LibraryStoreFindBookById(LibraryStore* store, i64 bookId) {
         return nullptr;
     }
     sqlite3_stmt* stmt =
-        Prepare(store, "SELECT id,path,title,open_count,reading_seconds,last_read_ms,0,bg_color,notebooklm "
+        Prepare(store, "SELECT id,path,title,open_count,reading_seconds,last_read_ms,0,bg_color,notebooklm,kind,url "
                        "FROM books WHERE id=?1");
     if (!stmt) {
         return nullptr;
@@ -1193,6 +1309,123 @@ LibraryBook* LibraryStoreFindBookById(LibraryStore* store, i64 bookId) {
     }
     sqlite3_finalize(stmt);
     return book;
+}
+
+bool LibraryStoreSetBookTitle(LibraryStore* store, i64 bookId, Str title) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0 || !title || title.len == 0) {
+        return false;
+    }
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE books SET title=?1,updated_ms=?2 WHERE id=?3");
+    if (!stmt) {
+        return false;
+    }
+    BindText(stmt, 1, title);
+    sqlite3_bind_int64(stmt, 2, UnixTimeMsNow());
+    sqlite3_bind_int64(stmt, 3, bookId);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    if (!ok) {
+        SetError(store, StrL("set book title"));
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool LibraryStoreSetBookUrl(LibraryStore* store, i64 bookId, Str url) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0 || !url) {
+        return false;
+    }
+    LibraryBook* book = LibraryStoreFindBookById(store, bookId);
+    if (!book || book->kind != LibraryBookKind::Web) {
+        DeleteLibraryBook(book);
+        str::ReplaceWithCopy(&store->error, StrL("not a web book"));
+        return false;
+    }
+    DeleteLibraryBook(book);
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE books SET url=?1,updated_ms=?2 WHERE id=?3 AND kind=1");
+    if (!stmt) {
+        return false;
+    }
+    BindText(stmt, 1, url);
+    sqlite3_bind_int64(stmt, 2, UnixTimeMsNow());
+    sqlite3_bind_int64(stmt, 3, bookId);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    if (!ok) {
+        SetError(store, StrL("set book url"));
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool LibraryStoreSetBookPath(LibraryStore* store, i64 bookId, Str newPath) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0 || !newPath || newPath.len == 0) {
+        return false;
+    }
+    LibraryBook* book = LibraryStoreFindBookById(store, bookId);
+    if (!book || !book->path) {
+        DeleteLibraryBook(book);
+        return false;
+    }
+    if (book->kind == LibraryBookKind::Web) {
+        str::ReplaceWithCopy(&store->error, StrL("web books have no filesystem path"));
+        DeleteLibraryBook(book);
+        return false;
+    }
+    TempStr normalized = NormalizePathTemp(newPath);
+    if (str::EqI(book->path, normalized)) {
+        DeleteLibraryBook(book);
+        return true;
+    }
+    Str key = PathKey(normalized);
+    sqlite3_stmt* clash = Prepare(store, "SELECT 1 FROM books WHERE path_key=?1 AND id<>?2");
+    bool conflict = false;
+    if (clash) {
+        BindText(clash, 1, key);
+        sqlite3_bind_int64(clash, 2, bookId);
+        conflict = sqlite3_step(clash) == SQLITE_ROW;
+        sqlite3_finalize(clash);
+    }
+    if (conflict) {
+        str::Free(key);
+        str::ReplaceWithCopy(&store->error, StrL("path already in library"));
+        DeleteLibraryBook(book);
+        return false;
+    }
+    // Path-only update: keep title and reading stats.
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE books SET path=?1,path_key=?2,updated_ms=?3 WHERE id=?4");
+    bool ok = stmt != nullptr;
+    if (ok) {
+        BindText(stmt, 1, normalized);
+        BindText(stmt, 2, key);
+        sqlite3_bind_int64(stmt, 3, UnixTimeMsNow());
+        sqlite3_bind_int64(stmt, 4, bookId);
+        ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+        sqlite3_finalize(stmt);
+    }
+    str::Free(key);
+    DeleteLibraryBook(book);
+    if (!ok) {
+        SetError(store, StrL("set book path"));
+    }
+    return ok;
+}
+
+bool LibraryStoreTouchBookOpen(LibraryStore* store, i64 bookId, i64 nowMs) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0) {
+        return false;
+    }
+    sqlite3_stmt* stmt = Prepare(
+        store, "UPDATE books SET open_count=open_count+1,last_read_ms=?1,updated_ms=?1 WHERE id=?2");
+    if (!stmt) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, 1, nowMs);
+    sqlite3_bind_int64(stmt, 2, bookId);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    if (!ok) {
+        SetError(store, StrL("touch book open"));
+    }
+    sqlite3_finalize(stmt);
+    return ok;
 }
 
 bool LibraryStoreRenameBookFile(LibraryStore* store, i64 bookId, Str newBaseName, Str* outNewPath) {
@@ -1210,6 +1443,11 @@ bool LibraryStoreRenameBookFile(LibraryStore* store, i64 bookId, Str newBaseName
     }
     LibraryBook* book = LibraryStoreFindBookById(store, bookId);
     if (!book || !book->path) {
+        DeleteLibraryBook(book);
+        return false;
+    }
+    if (book->kind == LibraryBookKind::Web) {
+        str::ReplaceWithCopy(&store->error, StrL("web books cannot be renamed on disk"));
         DeleteLibraryBook(book);
         return false;
     }
@@ -1287,6 +1525,9 @@ Vec<LibraryPathChange*> LibraryStorePreviewPathReplace(LibraryStore* store, Str 
     TempStr newNorm = NormalizePathTemp(newPrefix);
     Vec<LibraryBook*> books = LibraryStoreGetBooks(store, LibraryBookScope::All, 0, LibrarySort::Title, Str());
     for (LibraryBook* book : books) {
+        if (book->kind == LibraryBookKind::Web) {
+            continue;
+        }
         if (!HasPrefixBoundary(book->path, oldNorm)) continue;
         Str tail(book->path.s + len(oldNorm), len(book->path) - len(oldNorm));
         TempStr replaced = str::JoinTemp(newNorm, tail);

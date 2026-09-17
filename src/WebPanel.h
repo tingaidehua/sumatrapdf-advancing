@@ -12,13 +12,34 @@ void WebPanelOnDocumentChanged(MainWindow* win);
 void UpdateWebPanelDpi(MainWindow* win, int dpi);
 void UpdateWebPanelTheme(MainWindow* win);
 bool IsWebPanelVisible(MainWindow* win);
+
+// Center Web browser surface (canvas XOR). Shares WebView2 env/CDP with AI panel.
+void CreateWebBrowserPanel(MainWindow* win);
+void DestroyWebBrowserPanel(MainWindow* win);
+void RelayoutWebBrowserPanel(MainWindow* win);
+bool IsWebBrowserPanelVisible(MainWindow* win);
+// Instant canvas XOR WebView2 controllers (no deferred ghosting on fast switch).
+void ApplyCenterContentSurface(MainWindow* win);
+void OpenLibraryWebBook(MainWindow* win, i64 bookId);
+// kind: LibraryBookKind as int (Pdf=0, Web=1)
+void LibraryOnActiveBookChanged(MainWindow* win, i64 bookId, int kind);
+// Always create a new browser tab for url (duplicates allowed).
+void WebBrowserOpenUrlAsNewTab(MainWindow* win, Str url, Str title = {});
+void WebBrowserShowPanel(MainWindow* win);
+// Close the center-Web tab bound to this library web book (keeps the library row).
+void WebBrowserCloseTabForLibraryBook(MainWindow* win, i64 bookId);
+
 // Queue a NotebookLM add job and spawn the Node/Playwright helper (CDP 9224).
+// pdfPath and/or sourceUrl (center Web URL); at least one required.
+void WebPanelAddToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str sourceUrl, Str title);
 void WebPanelAddPdfToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str title);
 // Select only this PDF's source in NotebookLM (uncheck others) via Playwright.
 void WebPanelSelectNotebookLmSource(MainWindow* win, i64 bookId, Str pdfPath, Str title);
-// Clear per-PDF WebPanel tab id / url bindings (library context menu).
+// Clear per-PDF/Web AI panel tab id / url bindings.
 void WebPanelClearPdfTabIds(i64 bookId);
 void WebPanelClearPdfTabUrls(i64 bookId);
+// Library context menu: inspect + clear companion AI tab bindings.
+void WebPanelShowAiTabBindings(MainWindow* win, i64 bookId);
 void WebPanelPollBridgeResults();
 TempStr ScriptsWebviewDirTemp();
 void WebPanelSpawnScript(Str scriptName, Str extraArgs = {});

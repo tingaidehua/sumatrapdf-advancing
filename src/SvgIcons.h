@@ -40,6 +40,10 @@ extern const char* gIconTargetFocus;
 extern const char* gIconNotebookLm;
 // Browser-style tabs list for the AI WebPanel.
 extern const char* gIconTabs;
+// From user asset 历史.svg — Chrome-like browsing history.
+extern const char* gIconHistory;
+// Puzzle-piece — Chrome-like extensions menu (AI + Library Web headers).
+extern const char* gIconExtensions;
 
 struct Pixmap;
 

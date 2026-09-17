@@ -4,6 +4,8 @@
 #include "base/Base.h"
 #include "base/Win.h"
 #include "base/JsonParser.h"
+#include "base/File.h"
+#include "base/DirScan.h"
 
 #include "gui/UIModels.h"
 
@@ -713,6 +715,49 @@ class webview2_history_changed_handler : public ICoreWebView2HistoryChangedEvent
     ULONG m_refCount = 1;
 };
 
+class webview2_add_extension_handler : public ICoreWebView2ProfileAddBrowserExtensionCompletedHandler {
+  public:
+    ULONG STDMETHODCALLTYPE AddRef() { return ++m_refCount; }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG n = --m_refCount;
+        if (n == 0) {
+            delete this;
+        }
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppv) {
+        if (!ppv) {
+            return E_POINTER;
+        }
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == __uuidof(ICoreWebView2ProfileAddBrowserExtensionCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2BrowserExtension* result) {
+        if (FAILED(errorCode)) {
+            logf("WebView2: AddBrowserExtension failed 0x%x\n", (int)errorCode);
+            return S_OK;
+        }
+        if (result) {
+            WCHAR* nameW = nullptr;
+            if (SUCCEEDED(result->get_Name(&nameW)) && nameW) {
+                logf("WebView2: AddBrowserExtension ok '%s'\n", ToUtf8Temp(nameW));
+                CoTaskMemFree(nameW);
+            } else {
+                logf("WebView2: AddBrowserExtension ok\n");
+            }
+        }
+        return S_OK;
+    }
+
+  private:
+    ULONG m_refCount = 1;
+};
+
 class webview2_new_window_handler : public ICoreWebView2NewWindowRequestedEventHandler {
   public:
     explicit webview2_new_window_handler(WebviewWnd* wnd) : m_wnd(wnd) {}
@@ -1364,13 +1409,16 @@ void WebviewWnd::FailInit() {
     HwndDestroyWindowSafe(&hwnd);
 }
 
-void WebviewWnd::SetControllerVisible(bool visible) {
+void WebviewWnd::SetControllerVisible(bool visible, bool allowSuspend) {
     desiredVisible = visible;
     if (visible == isVisible) {
-        if ((visible && !isSuspended) || (!visible && isSuspended)) {
+        if ((visible && !isSuspended) || (!visible && (isSuspended || !allowSuspend))) {
             return;
         }
     }
+
+    logf("WebView::SetControllerVisible t=%llu hwnd=0x%p visible=%d allowSuspend=%d wasVis=%d suspended=%d\n",
+         (u64)GetTickCount64(), hwnd, visible ? 1 : 0, allowSuspend ? 1 : 0, isVisible ? 1 : 0, isSuspended ? 1 : 0);
 
     isVisible = visible;
     if (controller) {
@@ -1391,7 +1439,8 @@ void WebviewWnd::SetControllerVisible(bool visible) {
             webview3->Resume();
             isSuspended = false;
         }
-    } else if (!isSuspended) {
+    } else if (allowSuspend && !isSuspended) {
+        // TrySuspend is async and expensive — skip during rapid PDF/Web XOR switches.
         auto* handler = new webview2_try_suspend_handler();
         hr = webview3->TrySuspend(handler);
         handler->Release();
@@ -1400,6 +1449,25 @@ void WebviewWnd::SetControllerVisible(bool visible) {
         }
     }
     webview3->Release();
+}
+
+void WebviewWnd::EnsureOpaqueBackground() {
+    if (!controller) {
+        return;
+    }
+    defaultBackgroundColor = kColWhite;
+    ICoreWebView2Controller2* controller2 = nullptr;
+    HRESULT hr = controller->QueryInterface(IID_PPV_ARGS(&controller2));
+    if (FAILED(hr) || !controller2) {
+        return;
+    }
+    COREWEBVIEW2_COLOR bg = {};
+    bg.A = 255;
+    bg.R = 255;
+    bg.G = 255;
+    bg.B = 255;
+    controller2->put_DefaultBackgroundColor(bg);
+    controller2->Release();
 }
 
 // WebView2 can keep a hidden or old-size composition surface after showing a
@@ -1573,6 +1641,9 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
     if (emulateMobile) {
         ApplyMobileEmulation();
     }
+    if (enableBrowserExtensions) {
+        InstallBrowserExtensionsFromDir();
+    }
 
     // honor desiredVisible (SetControllerVisible) so BrowserDocView can create
     // hidden during a tab probe without the async ready callback showing it
@@ -1585,6 +1656,56 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
     bool want = desiredVisible;
     isVisible = !want; // force SetControllerVisible to apply
     SetControllerVisible(want);
+}
+
+void WebviewWnd::InstallBrowserExtensionsFromDir() {
+    if (!webview || !enableBrowserExtensions || !browserExtensionsDir) {
+        return;
+    }
+    if (!dir::Exists(browserExtensionsDir)) {
+        return;
+    }
+    ICoreWebView2_13* wv13 = nullptr;
+    if (FAILED(webview->QueryInterface(IID_PPV_ARGS(&wv13))) || !wv13) {
+        logf("WebView2: Profile/extensions require a newer WebView2 runtime\n");
+        return;
+    }
+    ICoreWebView2Profile* profile = nullptr;
+    HRESULT hr = wv13->get_Profile(&profile);
+    wv13->Release();
+    if (FAILED(hr) || !profile) {
+        return;
+    }
+    ICoreWebView2Profile7* profile7 = nullptr;
+    hr = profile->QueryInterface(IID_PPV_ARGS(&profile7));
+    profile->Release();
+    if (FAILED(hr) || !profile7) {
+        logf("WebView2: ICoreWebView2Profile7 unavailable (extensions API)\n");
+        return;
+    }
+
+    DirIter di{browserExtensionsDir};
+    di.includeDirs = true;
+    di.includeFiles = false;
+    for (DirIterEntry* de : di) {
+        if (!de || !de->isDir) {
+            continue;
+        }
+        TempStr folder = de->filePath;
+        TempStr manifest = path::JoinTemp(folder, StrL("manifest.json"));
+        if (!file::Exists(manifest)) {
+            continue;
+        }
+        auto* handler = new webview2_add_extension_handler();
+        hr = profile7->AddBrowserExtension(CWStrTemp(folder), handler);
+        handler->Release();
+        if (FAILED(hr)) {
+            logf("WebView2: AddBrowserExtension('%s') hr=0x%x\n", folder, (int)hr);
+        } else {
+            logf("WebView2: AddBrowserExtension queued '%s'\n", folder);
+        }
+    }
+    profile7->Release();
 }
 
 void WebviewWnd::UpdateWebviewSize() {
@@ -2305,6 +2426,9 @@ bool WebviewWnd::Embed(WebViewMsgCb& cb) {
         if (args) {
             options->put_AdditionalBrowserArguments(CWStrTemp(args));
         }
+        if (enableBrowserExtensions) {
+            options->put_AreBrowserExtensionsEnabled(TRUE);
+        }
         auto* envHandler = new webview2_dedicated_env_handler(slot);
         HRESULT hr =
             CreateCoreWebView2EnvironmentWithOptions(nullptr, userDataFolder.s, options.Get(), envHandler);
@@ -2594,6 +2718,7 @@ WebviewWnd::~WebviewWnd() {
     }
     str::Free(dataDir);
     str::Free(dedicatedBrowserArgs);
+    str::Free(browserExtensionsDir);
     str::Free(userAgent);
     wstr::Free(userDataFolder);
     wstr::Free(resourceUriPrefix);
@@ -2607,6 +2732,7 @@ WebviewWnd::WebviewWnd() = default;
 WebviewWnd::~WebviewWnd() {
     str::Free(dataDir);
     str::Free(dedicatedBrowserArgs);
+    str::Free(browserExtensionsDir);
     str::Free(userAgent);
     wstr::Free(userDataFolder);
     wstr::Free(resourceUriPrefix);
@@ -2664,8 +2790,10 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller*) {}
 void WebviewWnd::FailInit() {}
 void WebviewWnd::QueuePendingOp(PendingWebViewOp::Kind, Str, int) {}
 void WebviewWnd::FlushPendingOps() {}
-void WebviewWnd::SetControllerVisible(bool) {}
+void WebviewWnd::SetControllerVisible(bool, bool) {}
+void WebviewWnd::EnsureOpaqueBackground() {}
 void WebviewWnd::RefreshControllerSurface() {}
+void WebviewWnd::InstallBrowserExtensionsFromDir() {}
 void WebviewWnd::OnBrowserMessage(Str) {}
 void WebviewWnd::OnTimer(WindowBase::TimerEvent*) {}
 void WebviewWnd::OnSize(WindowBase::SizeEvent*) {}

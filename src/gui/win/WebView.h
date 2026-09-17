@@ -137,8 +137,11 @@ struct WebviewWnd : WindowBase {
     void FailInit();
     void QueuePendingOp(PendingWebViewOp::Kind kind, Str text, int token = 0);
     void FlushPendingOps();
-    void SetControllerVisible(bool visible);
+    void SetControllerVisible(bool visible, bool allowSuspend = true);
+    void EnsureOpaqueBackground();
     void RefreshControllerSurface();
+    // Load every unpacked extension under browserExtensionsDir (manifest.json).
+    void InstallBrowserExtensionsFromDir();
 
     virtual void OnBrowserMessage(Str msg);
 
@@ -193,8 +196,13 @@ struct WebviewWnd : WindowBase {
     // persistent browsing profile, remote debugging, and a custom user agent)
     bool useDedicatedEnvironment = false;
     // appended to AdditionalBrowserArguments when useDedicatedEnvironment is set
-    // (e.g. --remote-debugging-port=9223)
+    // (e.g. --remote-debugging-port=9224)
     Str dedicatedBrowserArgs;
+    // when true, AreBrowserExtensionsEnabled + load unpacked extensions from
+    // %OneDrive%/SumatraPDF/extensions/installed/
+    bool enableBrowserExtensions = false;
+    // optional root of unpacked extension folders (each with manifest.json)
+    Str browserExtensionsDir;
     // when non-empty, applied via ICoreWebView2Settings2::put_UserAgent
     Str userAgent;
     // when true, leave DevTools enabled (required for CDP / remote debugging)

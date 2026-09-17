@@ -172,6 +172,7 @@ MainWindow::~MainWindow() {
     delete buffer;
     delete tabSelectionHistory;
     ShutdownAIChatForMainWindow(this);
+    DestroyWebBrowserPanel(this);
     DestroyWebPanel(this);
     auto tabs = Tabs();
     DeleteVecMembers(tabs);

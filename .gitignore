@@ -56,4 +56,29 @@ tests/tmp/
 # WebPanel Node/Playwright helpers: keep sources, ignore runtime install/profile junk
 scripts/webview/manager/webview2/
 scripts/webview/.cache/
+scripts/webview/playwright-report/
+scripts/webview/test-results/
+scripts/webview/.auth/
 **/playwright/.local-browsers/
+scripts/webview/package-lock.json.bak
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.tmp
+*.bak
+*.swp
+*~
+
+# Runtime-seeded extension guide (repo keeps extensions/README.md)
+extensions/README.txt
+extensions/**/README.txt
+
+# Local OneDrive / WebPanel dumps if ever copied into the tree
+WebPanel/
+**/Browser-AIChat/
+**/Browser-Library/
+**/jobs/pending/
+**/jobs/done/
+**/jobs/failed/

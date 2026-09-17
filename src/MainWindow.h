@@ -38,6 +38,7 @@ struct WebPanelTab {
     Str id;    // stable id persisted across Sumatra restarts
     Str url;
     Str title; // document title (Chrome-like); falls back to host/url
+    bool titleLocked = false; // true after user rename — stop following document.title
     WebviewWnd* wv = nullptr;
 };
 
@@ -311,6 +312,8 @@ struct MainWindow {
     bool webPanelWebViewReady = false;
     VirtIconButton* webPanelBookmarksBtn = nullptr;
     VirtIconButton* webPanelTabsBtn = nullptr;
+    VirtIconButton* webPanelHistoryBtn = nullptr;
+    VirtIconButton* webPanelExtensionsBtn = nullptr;
     VirtIconButton* webPanelNotebookLmBtn = nullptr;
     VirtIconButton* webPanelFocusPdfBtn = nullptr;
     VirtIconButton* webPanelRefreshBtn = nullptr;
@@ -319,6 +322,29 @@ struct MainWindow {
     Str webPanelCurrentUrl;
     int webPanelCdpPort = 0;
     int webPanelDx = 0;
+
+    // Center Web browser (library web books). Isolated tabs; same WebView2 env/CDP as AI.
+    HWND hwndWebBrowserBox = nullptr;
+    VirtText* webBrowserLabel = nullptr;
+    HBox* webBrowserHeader = nullptr;
+    VirtRoot* webBrowserRoot = nullptr;
+    ILayout* webBrowserLayout = nullptr;
+    Spacer* webBrowserWebViewSlot = nullptr;
+    WebviewWnd* webBrowserWebView = nullptr;
+    bool webBrowserWebViewReady = false;
+    VirtIconButton* webBrowserBookmarksBtn = nullptr;
+    VirtIconButton* webBrowserTabsBtn = nullptr;
+    VirtIconButton* webBrowserHistoryBtn = nullptr;
+    VirtIconButton* webBrowserExtensionsBtn = nullptr;
+    VirtIconButton* webBrowserRefreshBtn = nullptr;
+    Vec<WebPanelTab> webBrowserTabs;
+    int webBrowserActiveTab = -1;
+    Str webBrowserCurrentUrl;
+    HwndSlot* webBrowserSlot = nullptr;
+
+    // Last library book shown (PDF or web); drives selection + per-book bindings.
+    i64 activeLibraryBookId = 0;
+    int activeLibraryBookKind = 0; // LibraryBookKind as int
 
     // vertical splitter for resizing left side panel
     // the splitters are virtual controls living in the frame's own tree
@@ -526,6 +552,7 @@ struct MainWindow {
             bool showMenuBarRebar = false;
             bool aiChatVisible = false;
             bool webPanelVisible = false;
+            bool webBrowserVisible = false;
             int aiChatDx = 0;
             bool sidebarOnRight = false;
         };
@@ -538,6 +565,7 @@ struct MainWindow {
         bool favVisible = false;
         bool aiChatVisible = false;
         bool webPanelVisible = false;
+        bool webBrowserVisible = false;
         bool updatePending = false; // a FrameUpdateUi uitask is queued
         bool toolbarDirty = false;  // repaint the toolbar on the next update
         bool tabsDirty = false;     // repaint the tab bar on the next update

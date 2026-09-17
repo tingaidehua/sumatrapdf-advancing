@@ -611,6 +611,15 @@ void TreeView::OnNotifyReflect(ControlBase::NotifyReflectEvent* rev) {
         return;
     }
 
+    // https://docs.microsoft.com/en-us/windows/win32/controls/tvn-itemexpanded
+    if (code == TVN_ITEMEXPANDED) {
+        if (onExpansionChanged.IsValid()) {
+            onExpansionChanged.Call();
+        }
+        rev->result = 0;
+        return;
+    }
+
     // https://docs.microsoft.com/en-us/windows/win32/controls/nm-click-tree-view
     if (code == NM_CLICK || code == NM_DBLCLK) {
         // log("tv: NM_CLICK\n");

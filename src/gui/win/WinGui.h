@@ -1048,6 +1048,9 @@ struct TreeView : ControlBase {
     // for WM_NOTIFY with TVN_SELCHANGED
     SelectionChangedHandler onSelectionChanged;
 
+    // for WM_NOTIFY with TVN_ITEMEXPANDED (user expand/collapse)
+    Func0 onExpansionChanged;
+
     // for WM_NOTIFY with NM_CLICK or NM_DBCLICK
     ClickHandler onClick;
 

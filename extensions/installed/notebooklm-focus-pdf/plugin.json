@@ -1,0 +1,8 @@
+{
+  "id": "notebooklm-focus-pdf",
+  "name": "仅与当前 PDF 对话",
+  "kind": "host",
+  "browser": "Browser-AIChat",
+  "action": "notebooklm.focus",
+  "description": "按图书馆 NotebookLM 记录，仅选中中间栏当前 PDF/网页来源并打开对话"
+}

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * Add a PDF into NotebookLM notebooks SumatraPDF1..N (sourcesPerNotebook from config.json).
+ * Add a PDF or website URL into NotebookLM notebooks SumatraPDF1..N.
  * Re-running updates books.notebooklm to the latest notebook/url/source.
  * Usage:
  *   node notebooklm-add.mjs --pdf "D:\\a.pdf" --bookId 12
+ *   node notebooklm-add.mjs --url "https://example.com" --bookId 12
  *   node notebooklm-add.mjs --job path\\to\\job.json
  */
 import path from "node:path";
@@ -14,6 +15,7 @@ import {
   ensureNotebook,
   countSources,
   addPdfSource,
+  addWebsiteSource,
   selectOnlySource,
   clickByText,
 } from "./lib/notebooklm.mjs";
@@ -87,35 +89,52 @@ async function pickNotebook(page, prior = {}) {
   throw new Error(`no free ${NOTEBOOK_PREFIX}* notebook slot`);
 }
 
+function selectKey(pdfPath, sourceUrl, title, upload) {
+  if (upload?.sourceTitle) return upload.sourceTitle;
+  if (title) return title;
+  if (pdfPath) return path.basename(pdfPath);
+  try {
+    return new URL(sourceUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return sourceUrl || "";
+  }
+}
+
 async function main() {
   ensureJobDirs();
   const jobPath = arg("job");
   const job = jobPath ? readJson(jobPath, {}) : {};
-  const pdfPath = arg("pdf", job.pdfPath);
+  const pdfPath = arg("pdf", job.pdfPath || null);
+  const sourceUrl = arg("url", job.sourceUrl || job.webUrl || null);
+  const title = arg("title", job.title || "");
   const bookId = Number(arg("bookId", job.bookId || 0));
-  if (!pdfPath) {
-    throw new Error("missing --pdf / job.pdfPath");
+  if (!pdfPath && !sourceUrl) {
+    throw new Error("missing --pdf/--url / job.pdfPath/job.sourceUrl");
   }
   const prior = extractPrior(job);
 
   const { browser, context, port } = await connectCdp();
-  log(`CDP ${port}`);
+  log(`CDP ${port} pdf=${pdfPath || ""} url=${sourceUrl || ""}`);
   try {
     const page = await notebookPage(context);
     const nb = await pickNotebook(page, prior);
-    const upload = await addPdfSource(page, pdfPath);
-    // Always leave exactly this PDF selected (not 全选).
-    await selectOnlySource(page, path.basename(pdfPath));
+    const upload = sourceUrl
+      ? await addWebsiteSource(page, sourceUrl, title)
+      : await addPdfSource(page, pdfPath);
+    const key = selectKey(pdfPath, sourceUrl, title, upload);
+    // Always leave exactly this source selected (not 全选).
+    await selectOnlySource(page, key);
     await clickByText(page, ["^对话$", "对话", "Chat"], 3000);
 
     const result = {
       action: "notebooklm.add",
       ok: !!upload.ok || !!upload.alreadyPresent,
       bookId,
-      pdfPath,
+      pdfPath: pdfPath || "",
+      sourceUrl: sourceUrl || "",
       notebook: nb.name,
       notebookUrl: page.url(),
-      sourceTitle: upload.sourceTitle || path.basename(pdfPath),
+      sourceTitle: upload.sourceTitle || key,
       sourceCountBefore: nb.count,
       upload,
       reusedNotebook: !!nb.reused,

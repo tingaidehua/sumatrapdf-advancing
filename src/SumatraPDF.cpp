@@ -2832,6 +2832,7 @@ static void CreateFrameLayout(MainWindow* win) {
     win->favSlot = new HwndSlot();
     win->fullFavSlot = new HwndSlot();
     win->canvasSlot = new HwndSlot();
+    win->webBrowserSlot = new HwndSlot();
     win->aiChatSlot = new HwndSlot();
     win->webPanelSlot = new HwndSlot();
     win->tabsSlot = new HwndSlot();
@@ -2856,10 +2857,11 @@ static void CreateFrameLayout(MainWindow* win) {
     sidebar->AddChild(win->favSplitter);
     sidebar->AddChild(win->favSlot, 1);
 
-    // canvas and the Favorites tab share this box; only one HWND is shown
+    // canvas, Favorites tab, and Web browser share this box; only one HWND is shown
     auto* content = new Overlay();
     content->AddChild(win->canvasSlot);
     content->AddChild(win->fullFavSlot);
+    content->AddChild(win->webBrowserSlot);
 
     auto* row = new HBox();
     row->alignCross = CrossAxisAlign::Stretch;
@@ -2911,6 +2913,7 @@ static void CreateSidebar(MainWindow* win) {
 
     CreateAIChatPanel(win);
     CreateWebPanel(win);
+    CreateWebBrowserPanel(win);
 
     win->libraryDx = gGlobalPrefs->libraryDx;
     win->uiState.libraryVisible = gGlobalPrefs->showLibrary && LibraryIsAvailable();
@@ -6742,6 +6745,7 @@ static bool IsUiLayoutEq(UILayout* s1, UILayout* s2) {
            s1->libraryVisible == s2->libraryVisible && s1->showFavorites == s2->showFavorites &&
            s1->favoritesAsTab == s2->favoritesAsTab && s1->showMenuBarRebar == s2->showMenuBarRebar &&
            s1->aiChatVisible == s2->aiChatVisible && s1->webPanelVisible == s2->webPanelVisible &&
+           s1->webBrowserVisible == s2->webBrowserVisible &&
            s1->aiChatDx == s2->aiChatDx &&
            s1->sidebarOnRight == s2->sidebarOnRight;
 }
@@ -6868,6 +6872,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     curState.showMenuBarRebar = IsShowingMenuBarRebar(win);
     curState.aiChatVisible = win->uiState.aiChatVisible;
     curState.webPanelVisible = win->uiState.webPanelVisible;
+    curState.webBrowserVisible = win->uiState.webBrowserVisible;
     curState.aiChatDx = win->aiChatDx;
     curState.sidebarOnRight = SidebarOnRightLayout();
 
@@ -6903,20 +6908,22 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
         const MainWindow::UIState& ui = win->uiState;
         WindowTab* cur = win->CurrentTab();
         bool favAsTab = cur && cur->IsFavoritesTab();
-        bool favVis = favAsTab || ui.favVisible;
-        bool tocVis = !favAsTab && ui.tocVisible;
+        bool webBrowserVis = !favAsTab && ui.webBrowserVisible;
+        // Bookmarks/TOC belong to PDF mode — hide when showing the Web surface.
+        bool favVis = !webBrowserVis && (favAsTab || ui.favVisible);
+        bool tocVis = !webBrowserVis && !favAsTab && ui.tocVisible;
         bool libraryVis = !favAsTab && ui.libraryVisible;
         bool aiVis = !favAsTab && ui.aiChatVisible && !ui.webPanelVisible;
         bool webVis = !favAsTab && ui.webPanelVisible && !ui.aiChatVisible;
         win->librarySplitter->SetIsVisible(libraryVis);
         HwndSetVisible(win->hwndLibraryBox, libraryVis);
-        win->sidebarSplitter->SetIsVisible(!favAsTab && (tocVis || favVis));
+        win->sidebarSplitter->SetIsVisible(!favAsTab && !webBrowserVis && (tocVis || favVis));
         HwndSetVisible(win->hwndTocBox, tocVis);
         win->favSplitter->SetIsVisible(tocVis && favVis);
         HwndSetVisible(win->hwndFavBox, favVis);
-        // canvas stays sized under a Favorites tab (only hidden) so switching
-        // back does not SetViewPortSize with a 0x0 canvas
-        HwndSetVisible(win->hwndCanvas, !favAsTab);
+        // canvas XOR web browser (Favorites tab hides both). Must also toggle
+        // WebView2 controllers — HWND hide alone leaves DComp ghost layers.
+        ApplyCenterContentSurface(win);
         if (win->hwndAiChatBox) {
             HwndSetVisible(win->hwndAiChatBox, aiVis);
         }
@@ -6986,9 +6993,10 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
 
     WindowTab* curTab = win->CurrentTab();
     bool favAsTab = curTab && curTab->IsFavoritesTab();
-    bool favVisible = favAsTab || win->uiState.favVisible;
-    bool tocVisible = !favAsTab && win->uiState.tocVisible;
-    bool sidebarVisible = !favAsTab && (tocVisible || win->uiState.favVisible);
+    bool webBrowserMode = !favAsTab && win->uiState.webBrowserVisible;
+    bool favVisible = !webBrowserMode && (favAsTab || win->uiState.favVisible);
+    bool tocVisible = !webBrowserMode && !favAsTab && win->uiState.tocVisible;
+    bool sidebarVisible = !favAsTab && !webBrowserMode && (tocVisible || win->uiState.favVisible);
     bool libraryVisible = !favAsTab && win->uiState.libraryVisible;
     bool webPanelVisible = !favAsTab && win->uiState.webPanelVisible && win->hwndWebPanelBox && !win->uiState.aiChatVisible;
     bool aiChatVisible = !favAsTab && win->uiState.aiChatVisible && win->hwndAiChatBox && !win->uiState.webPanelVisible;
@@ -7137,12 +7145,16 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     }
 
     // sidebar favorites vs. the full-window Favorites tab: same HWND, one slot
-    bool sidebarFav = !favAsTab && win->uiState.favVisible;
+    bool sidebarFav = !favAsTab && !webBrowserMode && win->uiState.favVisible;
+    bool webBrowserVisible = webBrowserMode && win->hwndWebBrowserBox;
+    bool canvasVisible = !favAsTab && !webBrowserVisible;
     SetVis(win->librarySlot, libraryVisible);
     SetVis(win->librarySplitter, libraryVisible);
     SetVis(win->tocSlot, tocVisible);
     SetVis(win->favSlot, sidebarFav);
     SetVis(win->fullFavSlot, favAsTab);
+    SetVis(win->canvasSlot, canvasVisible);
+    SetVis(win->webBrowserSlot, webBrowserVisible);
     SetVis(win->favSplitter, tocVisible && sidebarFav);
     SetVis(win->sidebarSplitter, sidebarVisible);
     SetVis(win->aiChatSplitter, aiChatVisible);
@@ -7182,13 +7194,14 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     BindSlot(win->tocSlot, win->hwndTocBox, &dh, tocVisible && !isFrameResize);
     BindSlot(win->favSlot, win->hwndFavBox, &dh, sidebarFav && !isFrameResize);
     BindSlot(win->fullFavSlot, win->hwndFavBox, &dh, favAsTab);
-    BindSlot(win->canvasSlot, win->hwndCanvas, &dh, !discardCanvasBits);
+    BindSlot(win->canvasSlot, win->hwndCanvas, &dh, canvasVisible && !discardCanvasBits);
+    BindSlot(win->webBrowserSlot, win->hwndWebBrowserBox, &dh, webBrowserVisible);
     BindSlot(win->aiChatSlot, win->hwndAiChatBox, &dh, aiChatVisible);
     BindSlot(win->webPanelSlot, win->hwndWebPanelBox, &dh, webPanelVisible);
 
     LayoutToSize(win->chromeLayout, {rc.dx, rc.dy});
     win->chromeLayout->SetBounds(rc);
-    if (discardCanvasBits) {
+    if (discardCanvasBits && canvasVisible) {
         dh.MoveWindowNoCopyBits(win->hwndCanvas, win->canvasSlot->lastBounds);
     }
     // Frame resize: keep the sidebar's x/width, only stretch its height.
@@ -7203,6 +7216,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
         if (sidebarFav) {
             StretchHwndHeight(dh, win->hwndFavBox, win->favSlot->lastBounds);
         }
+        if (webBrowserVisible && win->hwndWebBrowserBox && win->webBrowserSlot) {
+            StretchHwndHeight(dh, win->hwndWebBrowserBox, win->webBrowserSlot->lastBounds);
+        }
         if (aiChatVisible && win->hwndAiChatBox && win->aiChatSlot) {
             StretchHwndHeight(dh, win->hwndAiChatBox, win->aiChatSlot->lastBounds);
         }
@@ -7214,7 +7230,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     HwndSlot* chromeSlots[] = {win->librarySlot,        win->tabsSlot,          win->menuSlot,    win->toolbarTopSlot,
                                win->captionToolbarSlot, win->toolbarBottomSlot, win->capMenuSlot, win->capTabsRow1,
                                win->capTabsRow2,        win->tocSlot,           win->favSlot,     win->fullFavSlot,
-                               win->canvasSlot,         win->aiChatSlot,        win->webPanelSlot};
+                               win->canvasSlot,         win->webBrowserSlot,    win->aiChatSlot,  win->webPanelSlot};
     for (HwndSlot* s : chromeSlots) {
         ClearSlotDefer(s);
     }
@@ -7306,6 +7322,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     }
     if (win->uiState.webPanelVisible && win->hwndWebPanelBox) {
         RelayoutWebPanel(win);
+    }
+    if (win->uiState.webBrowserVisible && win->hwndWebBrowserBox) {
+        RelayoutWebBrowserPanel(win);
     }
     // A frame-size drag does not move the splitter; invalidating it paints a
     // 1-2px strip against the TOC and looks like the tree is shimmering.

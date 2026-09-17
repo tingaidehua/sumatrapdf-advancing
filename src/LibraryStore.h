@@ -1,6 +1,8 @@
 /* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
+#pragma once
+
 struct LibraryStore;
 
 enum class LibrarySort {
@@ -19,10 +21,17 @@ enum class LibraryBookScope {
     ManualRoot,
 };
 
+enum class LibraryBookKind {
+    Pdf = 0,
+    Web = 1,
+};
+
 struct LibraryBook {
     i64 id = 0;
     Str path;
     Str title;
+    Str url; // web books only; empty for PDF
+    LibraryBookKind kind = LibraryBookKind::Pdf;
     i64 openCount = 0;
     i64 readingSeconds = 0;
     i64 lastReadMs = 0;
@@ -56,6 +65,8 @@ Str LibraryStoreError(LibraryStore* store);
 
 LibraryBook* LibraryStoreRecordOpen(LibraryStore* store, Str path, Str title, i64 nowMs, bool* placedAtRoot = nullptr);
 LibraryBook* LibraryStoreAddBook(LibraryStore* store, Str path, Str title, i64 nowMs);
+// Web page as a first-class library book (stable id; url/title are attributes).
+LibraryBook* LibraryStoreAddWebBook(LibraryStore* store, Str url, Str title, i64 nowMs);
 LibraryBook* LibraryStoreImportBook(LibraryStore* store, Str path, Str title, i64 openCount, i64 nowMs);
 bool LibraryStoreAddReadingTime(LibraryStore* store, Str path, i64 seconds, i64 nowMs);
 Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope scope, i64 collectionId, LibrarySort sort,
@@ -81,7 +92,14 @@ Str LibraryStoreGetBookNotebookLm(LibraryStore* store, i64 bookId); // owned; ca
 LibraryBook* LibraryStoreFindBookByPath(LibraryStore* store, Str path); // owned; caller DeleteLibraryBook
 LibraryBook* LibraryStoreFindBookById(LibraryStore* store, i64 bookId); // owned; caller DeleteLibraryBook
 // Rename file on disk path + update books.path/title/path_key. newBaseName includes .pdf.
+// Rejects web books (use LibraryStoreSetBookTitle instead).
 bool LibraryStoreRenameBookFile(LibraryStore* store, i64 bookId, Str newBaseName, Str* outNewPath);
+// Title-only rename (PDF display name or web book label).
+bool LibraryStoreSetBookTitle(LibraryStore* store, i64 bookId, Str title);
+bool LibraryStoreSetBookUrl(LibraryStore* store, i64 bookId, Str url);
+// Update PDF path/path_key only (file moved elsewhere). Keeps title and other stats.
+bool LibraryStoreSetBookPath(LibraryStore* store, i64 bookId, Str newPath);
+bool LibraryStoreTouchBookOpen(LibraryStore* store, i64 bookId, i64 nowMs);
 
 Vec<LibraryPathChange*> LibraryStorePreviewPathReplace(LibraryStore* store, Str oldPrefix, Str newPrefix);
 bool LibraryStoreApplyPathReplace(LibraryStore* store, Vec<LibraryPathChange*>& changes);

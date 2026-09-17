@@ -17,6 +17,7 @@
 
 #include "Settings.h"
 #include "AppSettings.h"
+#include "AppTools.h"
 #include "DisplayMode.h"
 #include "DocController.h"
 #include "EngineBase.h"
@@ -36,6 +37,7 @@
 #include "PdfTools.h"
 #include "ScriptManager.h"
 
+#include "base/JsonParser.h"
 #include "FilterHighlightDraw.h"
 #include "LibraryPanel.h"
 #include "SumatraLog.h"
@@ -56,6 +58,8 @@ struct LibraryTreeItem {
     LibraryTreeKind kind = LibraryTreeKind::Root;
     Str text;
     Str path;
+    Str url;
+    LibraryBookKind bookKind = LibraryBookKind::Pdf;
     i64 bookId = 0;
     i64 collectionId = 0;
     bool isShelf = false;
@@ -67,6 +71,7 @@ LibraryTreeItem::~LibraryTreeItem() {
     DeleteVecMembers(children);
     str::Free(text);
     str::Free(path);
+    str::Free(url);
 }
 
 struct LibraryTreeModel : TreeModel {
@@ -96,9 +101,22 @@ static LibraryTreeItem* NewItem(LibraryTreeItem* parent, LibraryTreeKind kind, S
 static void AddBooks(LibraryTreeItem* parent, LibraryBookScope scope, i64 collectionId, Str filter) {
     Vec<LibraryBook*> books = LibraryStoreGetBooks(LibraryGetStore(), scope, collectionId, LibrarySort::Manual, filter);
     for (LibraryBook* book : books) {
-        auto* item = NewItem(parent, LibraryTreeKind::Book, book->title);
+        TempStr label = book->title;
+        if (book->kind == LibraryBookKind::Web) {
+            Str url = book->url ? book->url : book->path;
+            // Prefer stored tab title; fall back to full URL only until title syncs.
+            bool titleIsUrl = label && (str::StartsWithI(label, StrL("http://")) ||
+                                        str::StartsWithI(label, StrL("https://")));
+            if (!label || titleIsUrl) {
+                label = url;
+            }
+            label = fmt("🌐 %s", label ? label : StrL("网页"));
+        }
+        auto* item = NewItem(parent, LibraryTreeKind::Book, label);
         item->bookId = book->id;
         item->path = str::Dup(book->path);
+        item->url = str::Dup(book->url);
+        item->bookKind = book->kind;
         item->bgColor = book->bgColor;
     }
     DeleteLibraryBooks(books);
@@ -185,12 +203,83 @@ static void RememberExpandedCollectionsRec(MainWindow* win, LibraryTreeItem* ite
     }
 }
 
+static TempStr LibraryTreeUiPathTemp() {
+    return GetPathInAppDataDirTemp(StrL("SumatraPDF-library-ui.json"));
+}
+
+static void SaveLibraryTreeUiState(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    str::Builder out;
+    out.Append(StrL("{\n  \"expandedCollections\": ["));
+    for (int i = 0; i < len(win->expandedLibraryCollections); i++) {
+        if (i > 0) {
+            out.Append(StrL(", "));
+        }
+        out.Append(fmt("%lld", win->expandedLibraryCollections[i]));
+    }
+    out.Append(StrL("],\n  \"lastBookId\": "));
+    out.Append(fmt("%lld", win->activeLibraryBookId > 0 ? win->activeLibraryBookId : (i64)0));
+    out.Append(StrL("\n}\n"));
+    file::WriteFile(LibraryTreeUiPathTemp(), ToStr(out));
+}
+
+static void LoadLibraryTreeUiState(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    Str data = file::ReadFile(LibraryTreeUiPathTemp());
+    if (!data) {
+        return;
+    }
+    win->expandedLibraryCollections.Reset();
+    struct St {
+        MainWindow* win = nullptr;
+    } st{win};
+    auto onVal = [](St* s, json::Value* v) {
+        if (!s || !s->win || !v) {
+            return;
+        }
+        if (json::PathMatch(v->path, StrL("/expandedCollections"), StrL("*"))) {
+            if (v->type == json::Type::Number || v->type == json::Type::String) {
+                i64 id = v->value ? ParseInt64(v->value) : 0;
+                if (id > 0 && !s->win->expandedLibraryCollections.Contains(id)) {
+                    s->win->expandedLibraryCollections.Append(id);
+                }
+            }
+            return;
+        }
+        if (json::PathMatch(v->path, StrL("/lastBookId")) &&
+            (v->type == json::Type::Number || v->type == json::Type::String)) {
+            i64 id = v->value ? ParseInt64(v->value) : 0;
+            if (id > 0 && s->win->activeLibraryBookId <= 0) {
+                s->win->activeLibraryBookId = id;
+            }
+        }
+    };
+    json::Parse(data, MkFunc1<St, json::Value*>(onVal, &st));
+    str::Free(data);
+    if (len(win->expandedLibraryCollections) > 0 || win->activeLibraryBookId > 0) {
+        win->libraryExpansionInitialized = true;
+    }
+}
+
 static void RememberExpandedCollections(MainWindow* win) {
     if (!win || !win->libraryTreeView || !win->libraryTreeView->treeModel || win->libraryModelFiltered) return;
     win->expandedLibraryCollections.Reset();
     auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
     RememberExpandedCollectionsRec(win, model->root);
     win->libraryExpansionInitialized = true;
+    SaveLibraryTreeUiState(win);
+}
+
+static void OnLibraryTreeExpansionChanged(MainWindow* win) {
+    RememberExpandedCollections(win);
+}
+
+void LibrarySaveUiState(MainWindow* win) {
+    SaveLibraryTreeUiState(win);
 }
 
 static bool LibraryPathsEqual(Str a, Str b) {
@@ -216,6 +305,22 @@ static LibraryTreeItem* FindBookByPath(LibraryTreeItem* item, Str path) {
     return nullptr;
 }
 
+static LibraryTreeItem* FindBookById(LibraryTreeItem* item, i64 bookId) {
+    if (!item || bookId <= 0) {
+        return nullptr;
+    }
+    if (item->kind == LibraryTreeKind::Book && item->bookId == bookId) {
+        return item;
+    }
+    for (LibraryTreeItem* child : item->children) {
+        LibraryTreeItem* found = FindBookById(child, bookId);
+        if (found) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
 static Str CurrentPdfPath(MainWindow* win) {
     WindowTab* tab = win ? win->CurrentTab() : nullptr;
     if (!IsPdfTab(tab)) {
@@ -225,20 +330,25 @@ static Str CurrentPdfPath(MainWindow* win) {
 }
 
 // TreeView selection is the "currently viewed book" highlight. Rebuilds and
-// tab switches must restore it from the current tab path; otherwise Windows
-// leaves no selection or keeps the first inserted row blue.
+// tab switches must restore it from the active library book or current PDF.
 void SyncLibrarySelection(MainWindow* win) {
     if (!win || !win->libraryTreeView || !win->libraryTreeView->treeModel) {
         return;
     }
     auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
-    Str path = CurrentPdfPath(win);
-    LibraryTreeItem* book = FindBookByPath(model->root, path);
+    LibraryTreeItem* book = nullptr;
+    if (win->activeLibraryBookId > 0) {
+        book = FindBookById(model->root, win->activeLibraryBookId);
+    }
+    if (!book) {
+        Str path = CurrentPdfPath(win);
+        book = FindBookByPath(model->root, path);
+    }
     TreeItem want = book ? (TreeItem)book : TreeModel::kNullItem;
     if (win->libraryTreeView->GetSelection() == want) {
         return;
     }
-    logf("SyncLibrarySelection: path='%s' book=%d\n", path ? path : StrL(""), book ? 1 : 0);
+    logf("SyncLibrarySelection: bookId=%lld book=%d\n", win->activeLibraryBookId, book ? 1 : 0);
     win->libraryTreeView->SelectItem(want);
     if (!book) {
         return;
@@ -285,27 +395,80 @@ void RefreshLibraryPanels() {
     }
 }
 
+// Chrome-like: update a web book's library row label to the live tab title
+// without rebuilding the whole tree (avoids freeze on rapid title changes).
+void LibraryUpdateWebBookTabTitle(i64 bookId, Str title) {
+    if (bookId <= 0 || !title || title.len == 0) {
+        return;
+    }
+    if (str::StartsWithI(title, StrL("http://")) || str::StartsWithI(title, StrL("https://"))) {
+        return;
+    }
+    if (LibraryIsAvailable()) {
+        LibraryBook* book = LibraryStoreFindBookById(LibraryGetStore(), bookId);
+        if (book && book->kind == LibraryBookKind::Web && (!book->title || !str::Eq(book->title, title))) {
+            LibraryStoreSetBookTitle(LibraryGetStore(), bookId, title);
+        }
+        DeleteLibraryBook(book);
+    }
+    TempStr label = fmt("🌐 %s", title);
+    for (MainWindow* win : gWindows) {
+        if (!win || !win->libraryTreeView || !win->libraryTreeView->treeModel) {
+            continue;
+        }
+        auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
+        LibraryTreeItem* item = FindBookById(model->root, bookId);
+        if (!item || item->bookKind != LibraryBookKind::Web) {
+            continue;
+        }
+        if (str::Eq(item->text, label)) {
+            continue;
+        }
+        str::ReplaceWithCopy(&item->text, label);
+        win->libraryTreeView->UpdateItem((TreeItem)item);
+    }
+}
+
 static void OnFilterChanged(MainWindow* win) {
     RefreshLibraryPanel(win);
 }
 
 static void OpenLibraryItem(MainWindow* source, LibraryTreeItem* item) {
-    if (!item || !item->path) return;
+    if (!item) {
+        return;
+    }
+    if (item->bookKind == LibraryBookKind::Web) {
+        OpenLibraryWebBook(source, item->bookId);
+        return;
+    }
+    if (!item->path) {
+        return;
+    }
     MainWindow* existing = FindMainWindowByFile(item->path, true);
     if (existing) {
         existing->Focus();
         if (existing != source) {
             SyncLibrarySelection(source);
         }
+        // Still notify so canvas XOR / AI bindings refresh for this PDF.
+        LibraryOnActiveBookChanged(existing, item->bookId, (int)LibraryBookKind::Pdf);
         return;
     }
     LoadArgs args(item->path, source);
     StartLoadDocument(&args);
+    LibraryOnActiveBookChanged(source, item->bookId, (int)LibraryBookKind::Pdf);
 }
 
 static void OnTreeTooltip(TreeView::GetTooltipEvent* ev) {
     auto* item = (LibraryTreeItem*)ev->treeItem;
-    if (item && item->path) {
+    if (!item) {
+        return;
+    }
+    if (item->bookKind == LibraryBookKind::Web && item->url) {
+        str::BufSet(ev->info->pszText, ev->info->cchTextMax, item->url);
+        return;
+    }
+    if (item->path) {
         str::BufSet(ev->info->pszText, ev->info->cchTextMax, item->path);
     }
 }
@@ -491,11 +654,12 @@ enum {
     kLibraryMenuAddNotebookLm,
     kLibraryMenuSelectNotebookLm,
     kLibraryMenuRenameBook,
+    kLibraryMenuSetBookPath,
     kLibraryMenuViewDb,
     kLibraryMenuCompressPdf,
     kLibraryMenuScriptManager,
-    kLibraryMenuClearTabIds,
-    kLibraryMenuClearTabUrls,
+    kLibraryMenuViewAiTabs,
+    kLibraryMenuCloseWebTab,
     kLibraryMenuColorNone,
     kLibraryMenuColorFirst,
 };
@@ -598,13 +762,17 @@ static void ShowLibraryBookDbEntry(MainWindow* win, i64 bookId) {
     str::Builder out;
     out.Append(StrL("=== books ===\n"));
     out.Append(fmt("id:              %lld\n", book->id));
+    out.Append(fmt("kind:            %s\n", book->kind == LibraryBookKind::Web ? StrL("web") : StrL("pdf")));
     out.Append(fmt("title:           %s\n", book->title ? book->title : StrL("")));
     out.Append(fmt("path:            %s\n", book->path ? book->path : StrL("")));
+    out.Append(fmt("url:             %s\n", book->url ? book->url : StrL("")));
     out.Append(fmt("open_count:      %lld\n", book->openCount));
     out.Append(fmt("reading_seconds: %lld\n", book->readingSeconds));
     out.Append(fmt("last_read_ms:    %lld\n", book->lastReadMs));
     out.Append(fmt("bg_color:        0x%06X\n", book->bgColor));
-    out.Append(fmt("file_exists:     %s\n", (book->path && file::Exists(book->path)) ? StrL("yes") : StrL("NO")));
+    if (book->kind == LibraryBookKind::Pdf) {
+        out.Append(fmt("file_exists:     %s\n", (book->path && file::Exists(book->path)) ? StrL("yes") : StrL("NO")));
+    }
     out.Append(StrL("\n=== notebooklm JSON ===\n"));
     if (book->notebooklm && book->notebooklm.len > 0) {
         out.Append(book->notebooklm);
@@ -670,6 +838,47 @@ static void ShowLibraryBookDbEntry(MainWindow* win, i64 bookId) {
     DeleteLibraryBook(book);
 }
 
+static void CollectBooksInOrder(LibraryTreeItem* item, Vec<LibraryTreeItem*>* out) {
+    if (!item || !out) {
+        return;
+    }
+    if (item->kind == LibraryTreeKind::Book) {
+        out->Append(item);
+    }
+    for (LibraryTreeItem* child : item->children) {
+        CollectBooksInOrder(child, out);
+    }
+}
+
+// Next book in tree order after bookId; if closing the last, return the previous.
+static bool FindNeighborBookIds(LibraryTreeItem* root, i64 bookId, i64* nextIdOut, int* nextKindOut) {
+    if (!root || bookId <= 0 || !nextIdOut || !nextKindOut) {
+        return false;
+    }
+    *nextIdOut = 0;
+    *nextKindOut = 0;
+    Vec<LibraryTreeItem*> books;
+    CollectBooksInOrder(root, &books);
+    for (int i = 0; i < len(books); i++) {
+        if (books[i]->bookId != bookId) {
+            continue;
+        }
+        LibraryTreeItem* next = nullptr;
+        if (i + 1 < len(books)) {
+            next = books[i + 1];
+        } else if (i > 0) {
+            next = books[i - 1];
+        }
+        if (!next) {
+            return false;
+        }
+        *nextIdOut = next->bookId;
+        *nextKindOut = (int)next->bookKind;
+        return true;
+    }
+    return false;
+}
+
 static void OnTreeContextMenu(ContextMenuEvent* ev) {
     MainWindow* win = FindMainWindowByHwnd(ev->w->hwnd);
     if (!win) return;
@@ -680,7 +889,8 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     HMENU menu = CreatePopupMenu();
     Vec<HBITMAP> swatchBitmaps;
     if (item->kind == LibraryTreeKind::Book) {
-        if (item->path) {
+        const bool isWeb = item->bookKind == LibraryBookKind::Web;
+        if (!isWeb && item->path) {
             i64 bytes = file::GetSize(item->path);
             if (bytes >= 0) {
                 // MB with 2 decimals (avoid depending on float fmt — compute manually).
@@ -691,19 +901,25 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             }
         }
-        AppendMenuW(menu, MF_STRING, kLibraryMenuOpenFolder, CWStrTemp(_TRA("在文件夹中显示")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuCopyFilePath, CWStrTemp(_TRA("复制文件路径")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuCopyDirPath, CWStrTemp(_TRA("复制文件所在目录路径")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuCompressPdf, CWStrTemp(_TRA("压缩 PDF")));
+        if (isWeb) {
+            AppendMenuW(menu, MF_STRING, kLibraryMenuCopyFilePath, CWStrTemp(_TRA("复制 URL")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuCloseWebTab, CWStrTemp(_TRA("关闭 Tab")));
+        } else {
+            AppendMenuW(menu, MF_STRING, kLibraryMenuOpenFolder, CWStrTemp(_TRA("在文件夹中显示")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuCopyFilePath, CWStrTemp(_TRA("复制文件路径")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuCopyDirPath, CWStrTemp(_TRA("复制文件所在目录路径")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuCompressPdf, CWStrTemp(_TRA("压缩 PDF")));
+        }
         AppendMenuW(menu, MF_STRING, kLibraryMenuScriptManager, CWStrTemp(_TRA("脚本管理")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuAddNotebookLm, CWStrTemp(_TRA("添加到 NotebookLM")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuSelectNotebookLm, CWStrTemp(_TRA("在 NotebookLM 中仅选中此来源")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuRenameBook, CWStrTemp(_TRA("重命名")));
+        if (!isWeb) {
+            AppendMenuW(menu, MF_STRING, kLibraryMenuAddNotebookLm, CWStrTemp(_TRA("添加到 NotebookLM")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuSelectNotebookLm, CWStrTemp(_TRA("在 NotebookLM 中仅选中此来源")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuRenameBook, CWStrTemp(_TRA("重命名")));
+            AppendMenuW(menu, MF_STRING, kLibraryMenuSetBookPath, CWStrTemp(_TRA("修改文件路径名...")));
+        }
         AppendLibraryColorMenu(menu, swatchBitmaps);
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kLibraryMenuClearTabIds, CWStrTemp(_TRA("删除 Tab 页 ID 记录")));
-        AppendMenuW(menu, MF_STRING, kLibraryMenuClearTabUrls, CWStrTemp(_TRA("删除 Tab 页 URL 记录")));
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kLibraryMenuViewAiTabs, CWStrTemp(_TRA("查看伴随 AI Tab 页")));
         AppendMenuW(menu, MF_STRING, kLibraryMenuViewDb, CWStrTemp(_TRA("查看数据库条目")));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kLibraryMenuRemoveBook, CWStrTemp(_TRA("从图书馆移除")));
@@ -726,28 +942,32 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     }
     bool changed = false;
     if (cmd == kLibraryMenuOpenFolder) {
-        if (item->path) {
+        if (item->bookKind != LibraryBookKind::Web && item->path) {
             SumatraOpenPathInDefaultFileManager(item->path);
         }
     } else if (cmd == kLibraryMenuCopyFilePath) {
-        if (item->path) {
+        if (item->bookKind == LibraryBookKind::Web) {
+            if (item->url) {
+                CopyTextToClipboard(item->url);
+            }
+        } else if (item->path) {
             CopyTextToClipboard(item->path);
         }
     } else if (cmd == kLibraryMenuCopyDirPath) {
-        if (item->path) {
+        if (item->bookKind != LibraryBookKind::Web && item->path) {
             TempStr dir = path::GetDirTemp(item->path);
             if (dir) {
                 CopyTextToClipboard(dir);
             }
         }
     } else if (cmd == kLibraryMenuCompressPdf) {
-        if (item->path) {
+        if (item->bookKind != LibraryBookKind::Web && item->path) {
             ShowPdfCompressDialogForPath(win, item->path, false);
         }
     } else if (cmd == kLibraryMenuScriptManager) {
         ShowScriptManagerDialog(win);
     } else if (cmd == kLibraryMenuAddNotebookLm) {
-        if (item->path) {
+        if (item->bookKind != LibraryBookKind::Web && item->path) {
             TempStr title = item->text ? item->text : item->path;
             TempStr uploadPath = item->path;
             i64 bytes = file::GetSize(item->path);
@@ -769,11 +989,11 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
             uitask::Post(MkFunc0Void(WebPanelPollBridgeResults), "NotebookLmPoll");
         }
     } else if (cmd == kLibraryMenuSelectNotebookLm) {
-        if (item->path) {
+        if (item->bookKind != LibraryBookKind::Web && item->path) {
             WebPanelSelectNotebookLmSource(win, item->bookId, item->path, item->text ? item->text : item->path);
         }
     } else if (cmd == kLibraryMenuRenameBook) {
-        if (item->path && item->bookId > 0) {
+        if (item->bookId > 0 && item->bookKind != LibraryBookKind::Web && item->path) {
             Str name = PromptLibraryText(win->hwndFrame, _TRA("重命名"), _TRA("新文件名（含扩展名）"));
             if (name) {
                 TempStr base = name;
@@ -794,16 +1014,68 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
                 str::Free(name);
             }
         }
+    } else if (cmd == kLibraryMenuSetBookPath) {
+        if (item->bookKind != LibraryBookKind::Web && item->bookId > 0) {
+            Str path = PromptLibraryText(win->hwndFrame, _TRA("修改文件路径名"),
+                                         _TRA("新的完整路径（含文件名）"));
+            if (path) {
+                Str oldPath = str::Dup(item->path);
+                if (LibraryStoreSetBookPath(LibraryGetStore(), item->bookId, path)) {
+                    UpdateOpenTabsAfterRename(oldPath, path);
+                    changed = true;
+                } else {
+                    MessageBoxW(win->hwndFrame,
+                                CWStrTemp(fmt("%s\n%s", _TRA("修改路径失败。"), LibraryGetError())),
+                                CWStrTemp(_TRA("修改文件路径名")), MB_OK | MB_ICONERROR);
+                }
+                str::Free(oldPath);
+                str::Free(path);
+            }
+        }
+    } else if (cmd == kLibraryMenuCloseWebTab) {
+        // Close Tab = remove library web entry + browser tab, then open the next book.
+        if (item->bookKind == LibraryBookKind::Web && item->bookId > 0) {
+            i64 closedId = item->bookId;
+            i64 nextId = 0;
+            int nextKind = 0;
+            auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
+            bool hasNext = model && FindNeighborBookIds(model->root, closedId, &nextId, &nextKind);
+            WebBrowserCloseTabForLibraryBook(win, closedId);
+            WebPanelClearPdfTabIds(closedId);
+            WebPanelClearPdfTabUrls(closedId);
+            if (win->activeLibraryBookId == closedId) {
+                win->activeLibraryBookId = 0;
+            }
+            if (LibraryStoreRemoveBook(LibraryGetStore(), closedId)) {
+                RefreshLibraryPanels();
+                if (hasNext && nextId > 0) {
+                    if (nextKind == (int)LibraryBookKind::Web) {
+                        OpenLibraryWebBook(win, nextId);
+                    } else if (model) {
+                        // Model was rebuilt; look up the PDF path from the new tree.
+                        auto* neu = (LibraryTreeModel*)win->libraryTreeView->treeModel;
+                        LibraryTreeItem* nextItem = neu ? FindBookById(neu->root, nextId) : nullptr;
+                        if (nextItem) {
+                            OpenLibraryItem(win, nextItem);
+                        } else {
+                            LibraryOnActiveBookChanged(win, nextId, nextKind);
+                        }
+                    }
+                } else {
+                    win->uiState.webBrowserVisible = false;
+                    ApplyCenterContentSurface(win);
+                    win->uiState.layout = {};
+                    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
+                }
+                LibrarySaveUiState(win);
+            }
+        }
+    } else if (cmd == kLibraryMenuViewAiTabs) {
+        if (item->bookId > 0) {
+            WebPanelShowAiTabBindings(win, item->bookId);
+        }
     } else if (cmd == kLibraryMenuViewDb) {
         ShowLibraryBookDbEntry(win, item->bookId);
-    } else if (cmd == kLibraryMenuClearTabIds) {
-        if (item->bookId > 0) {
-            WebPanelClearPdfTabIds(item->bookId);
-        }
-    } else if (cmd == kLibraryMenuClearTabUrls) {
-        if (item->bookId > 0) {
-            WebPanelClearPdfTabUrls(item->bookId);
-        }
     } else if (cmd == kLibraryMenuColorNone) {
         if (item->kind == LibraryTreeKind::Book) {
             changed = LibraryStoreSetBookBgColor(LibraryGetStore(), item->bookId, 0);
@@ -1256,6 +1528,8 @@ enum {
     kLibraryAddShelf = 1,
     kLibraryAddFolder,
     kLibraryAddPdf,
+    kLibraryAddWeb,
+    kLibraryAddWebClipboard,
     kLibraryImportDir,
     kLibraryReplacePath,
 };
@@ -1500,12 +1774,275 @@ static void ImportPdfDirectory(MainWindow* win) {
     RefreshLibraryPanels();
 }
 
+static Str PromptLibraryMultiline(HWND parent, Str title, Str label) {
+    LibraryPromptState state{title, label};
+    LibraryPromptTemplate t;
+    t.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+    t.dlg.dwExtendedStyle = WS_EX_DLGMODALFRAME;
+    t.dlg.cx = 360;
+    t.dlg.cy = 180;
+    auto proc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> INT_PTR {
+        auto* state = (LibraryPromptState*)GetWindowLongPtrW(hwnd, DWLP_USER);
+        if (msg == WM_INITDIALOG) {
+            state = (LibraryPromptState*)lp;
+            SetWindowLongPtrW(hwnd, DWLP_USER, (LONG_PTR)state);
+            SetWindowTextW(hwnd, CWStrTemp(state->title));
+            HFONT font = GetAppFont()->GetHFont();
+            Rect rc = HwndClientRect(hwnd);
+            HWND labelHwnd =
+                CreateWindowW(WC_STATICW, CWStrTemp(state->label), WS_CHILD | WS_VISIBLE, 12, 10, rc.dx - 24, 36, hwnd,
+                              nullptr, GetModuleHandleW(nullptr), nullptr);
+            state->edit = CreateWindowExW(
+                WS_EX_CLIENTEDGE, WC_EDITW, L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL, 12, 48,
+                rc.dx - 24, rc.dy - 96, hwnd, (HMENU)kLibraryPromptEdit, GetModuleHandleW(nullptr), nullptr);
+            HWND ok =
+                CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("OK")), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              rc.dx - 174, rc.dy - 38, 76, 26, hwnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
+            HWND cancel =
+                CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("Cancel")), WS_CHILD | WS_VISIBLE | WS_TABSTOP, rc.dx - 88,
+                              rc.dy - 38, 76, 26, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+            for (HWND control : {labelHwnd, state->edit, ok, cancel}) {
+                SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
+            }
+            HwndSetFocus(state->edit);
+            return FALSE;
+        }
+        if (msg == WM_COMMAND && LOWORD(wp) == IDOK && state) {
+            int n = GetWindowTextLengthW(state->edit);
+            WCHAR* value = AllocArrayTemp<WCHAR>(n + 1);
+            GetWindowTextW(state->edit, value, n + 1);
+            state->result = str::Dup(ToUtf8Temp(value));
+            str::TrimWSInPlace(state->result, str::TrimOpt::Both);
+            if (!state->result) {
+                MessageBeep(MB_ICONWARNING);
+                return TRUE;
+            }
+            EndDialog(hwnd, IDOK);
+            return TRUE;
+        }
+        if ((msg == WM_COMMAND && LOWORD(wp) == IDCANCEL) || msg == WM_CLOSE) {
+            EndDialog(hwnd, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    };
+    INT_PTR result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &t.dlg, parent, proc, (LPARAM)&state);
+    if (result != IDOK) {
+        str::Free(state.result);
+        return {};
+    }
+    return state.result;
+}
+
+static TempStr NormalizeSiteUrlTemp(Str raw) {
+    if (!raw) {
+        return {};
+    }
+    TempStr s = str::DupTemp(raw);
+    while (s.len > 0 && (s.s[0] == ' ' || s.s[0] == '\t' || s.s[0] == '"' || s.s[0] == '\'' || s.s[0] == '<' ||
+                         s.s[0] == '(')) {
+        s = Str(s.s + 1, s.len - 1);
+    }
+    while (s.len > 0) {
+        char c = s.s[s.len - 1];
+        if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '>' || c == ')' || c == ',' || c == ';' || c == '.') {
+            s = Str(s.s, s.len - 1);
+            continue;
+        }
+        break;
+    }
+    if (!s) {
+        return {};
+    }
+    if (str::StartsWithI(s, StrL("http://")) || str::StartsWithI(s, StrL("https://"))) {
+        return str::DupTemp(s);
+    }
+    if (str::StartsWithI(s, StrL("www."))) {
+        return str::JoinTemp(StrL("https://"), s);
+    }
+    // Bare domains like example.com/path
+    if (str::IndexOfChar(s, '.') >= 0 && str::IndexOfChar(s, ' ') < 0 && str::IndexOfChar(s, '\\') < 0) {
+        return str::JoinTemp(StrL("https://"), s);
+    }
+    return {};
+}
+
+static void ParseSiteUrls(Str text, Vec<Str>* out) {
+    if (!text || !out) {
+        return;
+    }
+    int i = 0;
+    while (i < text.len) {
+        while (i < text.len && (text.s[i] == ' ' || text.s[i] == '\t' || text.s[i] == '\r' || text.s[i] == '\n')) {
+            i++;
+        }
+        if (i >= text.len) {
+            break;
+        }
+        int start = i;
+        while (i < text.len && text.s[i] != ' ' && text.s[i] != '\t' && text.s[i] != '\r' && text.s[i] != '\n') {
+            i++;
+        }
+        TempStr token = NormalizeSiteUrlTemp(Str(text.s + start, i - start));
+        if (token) {
+            out->Append(str::Dup(token));
+        }
+    }
+}
+
+static TempStr LibraryClipboardTextTemp() {
+    if (!OpenClipboard(nullptr)) {
+        return {};
+    }
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    TempStr out = {};
+    if (h) {
+        auto* w = (WCHAR*)GlobalLock(h);
+        if (w) {
+            out = ToUtf8Temp(w);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return out;
+}
+
+static i64 EnsureWebSitesCollectionId() {
+    Vec<LibraryCollection*> cols = LibraryStoreGetCollections(LibraryGetStore());
+    i64 id = 0;
+    i64 legacyId = 0;
+    for (LibraryCollection* c : cols) {
+        if (c->parentId != 0 || !c->name) {
+            continue;
+        }
+        if (str::Eq(c->name, StrL("网页"))) {
+            id = c->id;
+            break;
+        }
+        if (str::Eq(c->name, StrL("网站"))) {
+            legacyId = c->id;
+        }
+    }
+    DeleteLibraryCollections(cols);
+    if (id > 0) {
+        return id;
+    }
+    if (legacyId > 0) {
+        LibraryStoreRenameCollection(LibraryGetStore(), legacyId, StrL("网页"));
+        return legacyId;
+    }
+    LibraryCollection* created = LibraryStoreCreateCollection(LibraryGetStore(), 0, false, StrL("网页"));
+    if (!created) {
+        return 0;
+    }
+    id = created->id;
+    DeleteLibraryCollection(created);
+    return id;
+}
+
+// Add each URL as its own library web book (duplicates allowed) under 网页,
+// and open a dedicated browser tab for each.
+static void AddSitesToLibraryAndTabs(MainWindow* win, Vec<Str>& urls, bool placeInWebFolder) {
+    if (!win || len(urls) == 0 || !LibraryIsAvailable()) {
+        return;
+    }
+    i64 folderId = placeInWebFolder ? EnsureWebSitesCollectionId() : 0;
+    i64 firstBookId = 0;
+    int added = 0;
+    for (Str url : urls) {
+        // Title starts empty — library shows full URL until document.title arrives.
+        LibraryBook* book = LibraryStoreAddWebBook(LibraryGetStore(), url, StrL(""), UnixTimeMsNow());
+        if (!book) {
+            continue;
+        }
+        if (folderId > 0) {
+            LibraryStorePlaceBook(LibraryGetStore(), book->id, 0, folderId, false);
+        }
+        // Bind before navigate so title/url sync lands on the correct library row.
+        win->activeLibraryBookId = book->id;
+        win->activeLibraryBookKind = (int)LibraryBookKind::Web;
+        if (firstBookId == 0) {
+            firstBookId = book->id;
+        }
+        WebBrowserOpenUrlAsNewTab(win, url, Str{});
+        DeleteLibraryBook(book);
+        added++;
+    }
+    RefreshLibraryPanels();
+    if (firstBookId > 0) {
+        win->activeLibraryBookId = firstBookId;
+        win->activeLibraryBookKind = (int)LibraryBookKind::Web;
+        WebBrowserShowPanel(win);
+        SyncLibrarySelection(win);
+    }
+    if (added == 0) {
+        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("未识别到有效的网页链接。")), CWStrTemp(_TRA("添加网页")),
+                    MB_OK | MB_ICONWARNING);
+    }
+}
+
+void LibraryOpenWebUrlInBrowser(MainWindow* win, Str url) {
+    if (!win || !url || !LibraryIsAvailable()) {
+        return;
+    }
+    Vec<Str> urls;
+    urls.Append(str::Dup(url));
+    AddSitesToLibraryAndTabs(win, urls, true);
+    for (Str u : urls) {
+        str::Free(u);
+    }
+}
+
+static void AddWebSitesPrompt(MainWindow* win) {
+    if (!win || !LibraryIsAvailable()) {
+        return;
+    }
+    Str text = PromptLibraryMultiline(win->hwndFrame, _TRA("添加网页"),
+                                      _TRA("输入一个或多个网址（空格或换行分隔）"));
+    if (!text) {
+        return;
+    }
+    Vec<Str> urls;
+    ParseSiteUrls(text, &urls);
+    str::Free(text);
+    AddSitesToLibraryAndTabs(win, urls, true);
+    for (Str u : urls) {
+        str::Free(u);
+    }
+}
+
+static void AddWebSitesFromClipboard(MainWindow* win) {
+    if (!win || !LibraryIsAvailable()) {
+        return;
+    }
+    TempStr clip = LibraryClipboardTextTemp();
+    if (!clip) {
+        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("粘贴板中没有文本。")), CWStrTemp(_TRA("添加网页从粘贴板")),
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    Vec<Str> urls;
+    ParseSiteUrls(clip, &urls);
+    if (len(urls) == 0) {
+        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("粘贴板中未检测到网页链接。")),
+                    CWStrTemp(_TRA("添加网页从粘贴板")), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    AddSitesToLibraryAndTabs(win, urls, true);
+    for (Str u : urls) {
+        str::Free(u);
+    }
+}
+
 static void AddMenu(MainWindow* win, VirtMouseEvent* ev) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kLibraryAddFolder, CWStrTemp(_TRA("新建文件夹")));
     AppendMenuW(menu, MF_STRING, kLibraryAddShelf, CWStrTemp(_TRA("新建书架")));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kLibraryAddPdf, CWStrTemp(_TRA("添加 PDF...")));
+    AppendMenuW(menu, MF_STRING, kLibraryAddWeb, CWStrTemp(_TRA("添加网页...")));
+    AppendMenuW(menu, MF_STRING, kLibraryAddWebClipboard, CWStrTemp(_TRA("添加网页从粘贴板")));
     AppendMenuW(menu, MF_STRING, kLibraryImportDir, CWStrTemp(_TRA("导入 PDF 目录...")));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kLibraryReplacePath, CWStrTemp(_TRA("替换路径前缀...")));
@@ -1518,6 +2055,10 @@ static void AddMenu(MainWindow* win, VirtMouseEvent* ev) {
         if (CreateNamedCollection(win, 0, false)) RefreshLibraryPanels();
     } else if (cmd == kLibraryAddPdf) {
         AddPdfFiles(win);
+    } else if (cmd == kLibraryAddWeb) {
+        AddWebSitesPrompt(win);
+    } else if (cmd == kLibraryAddWebClipboard) {
+        AddWebSitesFromClipboard(win);
     } else if (cmd == kLibraryImportDir) {
         ImportPdfDirectory(win);
     } else if (cmd == kLibraryReplacePath) {
@@ -1604,6 +2145,7 @@ void CreateLibraryPanel(MainWindow* win) {
     tree->onContextMenu = MkFunc1Void(OnTreeContextMenu);
     tree->onGetTooltip = MkFunc1Void(OnTreeTooltip);
     tree->onCustomDraw = MkFunc1Void(OnLibraryCustomDraw);
+    tree->onExpansionChanged = MkFunc0(OnLibraryTreeExpansionChanged, win);
     tree->Create(treeArgs);
     LONG_PTR noDrag = GetWindowLongPtrW(tree->hwnd, GWL_STYLE);
     SetWindowLongPtrW(tree->hwnd, GWL_STYLE, noDrag | TVS_DISABLEDRAGDROP);
@@ -1627,6 +2169,7 @@ void CreateLibraryPanel(MainWindow* win) {
 
     if (!gLibraryBoxWndProc) gLibraryBoxWndProc = (WNDPROC)GetWindowLongPtrW(win->hwndLibraryBox, GWLP_WNDPROC);
     SetWindowLongPtrW(win->hwndLibraryBox, GWLP_WNDPROC, (LONG_PTR)LibraryBoxWndProc);
+    LoadLibraryTreeUiState(win);
     RefreshLibraryPanel(win);
     UpdateControlsColors(win);
 }

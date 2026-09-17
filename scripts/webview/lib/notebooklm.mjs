@@ -212,6 +212,109 @@ export async function addPdfSource(page, pdfPath) {
   return { ok: false, waitedSec: 120, sourceTitle: base, sourceCount: await countSources(page) };
 }
 
+/** Add a website / YouTube URL as a NotebookLM source (paste into 网站和 YouTube 网址). */
+export async function addWebsiteSource(page, sourceUrl, sourceTitle = "") {
+  const url = String(sourceUrl || "").trim();
+  if (!url) {
+    return { ok: false, waitedSec: 0, sourceTitle: "", error: "empty-url" };
+  }
+  let host = "";
+  try {
+    host = new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    host = url.slice(0, 48);
+  }
+  const label = String(sourceTitle || host || url).trim();
+
+  await clickByText(page, ["^来源$", "Sources", "来源"], 5000);
+  await page.waitForTimeout(500);
+
+  if (await sourceListed(page, label) || (host && (await sourceListed(page, host)))) {
+    return { ok: true, waitedSec: 0, sourceTitle: label, alreadyPresent: true, sourceUrl: url };
+  }
+
+  const before = await countSources(page);
+
+  await clickByText(page, ["添加来源", "Add source", "Upload", "上传", "add"], 8000);
+  await page.waitForTimeout(600);
+
+  const openedWeb = await clickByText(
+    page,
+    ["^网站$", "Website", "网站和 YouTube", "Websites?", "YouTube"],
+    8000,
+  );
+  if (!openedWeb) {
+    return { ok: false, waitedSec: 0, sourceTitle: label, sourceUrl: url, error: "no-website-button" };
+  }
+  await page.waitForTimeout(700);
+
+  // Paste into "粘贴任何链接" / "Paste any link" box.
+  const filled = await page.evaluate((text) => {
+    const nodes = [
+      ...document.querySelectorAll("textarea, input[type='text'], input[type='url'], [contenteditable='true']"),
+    ];
+    const box =
+      nodes.find((el) =>
+        /粘贴|链接|paste|link|url|youtube/i.test(
+          el.placeholder || el.getAttribute("aria-label") || el.getAttribute("data-placeholder") || "",
+        ),
+      ) || nodes.find((el) => el.offsetParent !== null) || nodes[0];
+    if (!box) return false;
+    box.scrollIntoView({ block: "center" });
+    box.focus();
+    if (box.isContentEditable) {
+      box.textContent = text;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      box.value = text;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+      box.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    return true;
+  }, url);
+
+  if (!filled) {
+    const loc = page
+      .locator('textarea, input[type="url"], input[type="text"]')
+      .filter({ hasNot: page.locator("[disabled]") })
+      .first();
+    await loc.fill(url, { timeout: 5000 }).catch(() => null);
+  }
+  await page.waitForTimeout(400);
+
+  const inserted = await clickByText(page, ["^插入$", "Insert", "添加", "Add", "提交", "Submit"], 6000);
+  if (!inserted) {
+    await page.keyboard.press("Enter");
+  }
+  await page.waitForTimeout(800);
+
+  for (let i = 0; i < 90; i++) {
+    await page.waitForTimeout(1000);
+    await clickByText(page, ["^来源$", "Sources", "来源"], 1500).catch(() => false);
+    const listed =
+      (await page.evaluate((want) => (document.body?.innerText || "").includes(want), label)) ||
+      (host && (await page.evaluate((want) => (document.body?.innerText || "").includes(want), host)));
+    const after = await countSources(page);
+    if (listed || (before >= 0 && after > before)) {
+      return {
+        ok: true,
+        waitedSec: i + 1,
+        sourceTitle: label,
+        sourceUrl: url,
+        sourceCount: after,
+      };
+    }
+  }
+  return {
+    ok: false,
+    waitedSec: 90,
+    sourceTitle: label,
+    sourceUrl: url,
+    sourceCount: await countSources(page),
+    error: "timeout-waiting-source",
+  };
+}
+
 function pathBase(p) {
   const s = String(p || "").replace(/\\/g, "/");
   const i = s.lastIndexOf("/");

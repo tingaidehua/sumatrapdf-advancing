@@ -1,0 +1,8 @@
+{
+  "id": "notebooklm-add",
+  "name": "添加到 NotebookLM",
+  "kind": "host",
+  "browser": "Browser-AIChat",
+  "action": "notebooklm.add",
+  "description": "将中间栏当前 PDF 或网页加入 NotebookLM（Playwright / CDP 9224）"
+}

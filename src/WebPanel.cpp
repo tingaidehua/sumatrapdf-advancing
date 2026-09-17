@@ -37,6 +37,7 @@
 #include "AppTools.h"
 #include "Library.h"
 #include "LibraryStore.h"
+#include "LibraryPanel.h"
 #include "base/JsonParser.h"
 
 #include <psapi.h>
@@ -44,7 +45,8 @@
 
 namespace {
 
-constexpr int kDefaultCdpPort = 9224;
+constexpr int kDefaultCdpPort = 9224;      // Browser-AIChat (NotebookLM / Playwright)
+constexpr int kLibraryCdpPort = 9225;      // Browser-Library (center Web)
 // Match anything-copilot: iPhone Safari UA + narrow viewport (no hybrid desktop)
 static const char* kMobileUserAgent =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
@@ -114,11 +116,13 @@ void UpdateWebPanelCpuSample();
 TempStr WebPanelResourceStatsTemp();
 void RebuildPinStrip(MainWindow* win);
 void EnsureWebPanelWebView(MainWindow* win);
+void RestoreBookAiBindings(MainWindow* win, i64 bookId, LibraryBookKind kind);
 void DeleteBookmarkAt(MainWindow* win, int idx);
 void ActivateWebPanelTab(MainWindow* win, Str url);
 void ShowActiveWebPanelTab(MainWindow* win);
 WebviewWnd* CreateWebPanelTabWebView(MainWindow* win, Str url);
 bool OnWebNavStarting(void* ctx, Str url, bool newWindow);
+bool OnWebBrowserNavStarting(void* ctx, Str url, bool newWindow);
 void OnWebNavCompleted(void* ctx, Str url, bool success);
 void OnWebSourceChanged(void* ctx, WebviewWnd* sender, Str url);
 void OnWebDocumentTitleChanged(void* ctx, WebviewWnd* sender, Str title);
@@ -126,6 +130,7 @@ void OnWebPanelJsNotify(void* ctx, Str method, Str paramsJson);
 int FindWebPanelTabByWebView(MainWindow* win, WebviewWnd* wv);
 void SyncWebPanelTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str title);
 TempStr EscapeJsonTemp(Str s);
+void EnsureBrowserExtensionsLayout();
 
 TempStr WebPanelDataDirTemp() {
     // Canonical tree under %OneDrive%\SumatraPDF\WebPanel\ (unified backup root).
@@ -171,26 +176,33 @@ void EnsureWebPanelDataLayout() {
     MigrateWebPanelFile(StrL("web-bridge.json"), StrL("bridge\\web-bridge.json"));
     MigrateWebPanelFile(StrL("bridge.log"), StrL("bridge\\bridge.log"));
     MigrateWebPanelDir(StrL("favicons"), StrL("cache\\favicons"));
-    MigrateWebPanelDir(StrL("WebView2"), StrL("profile\\WebView2"));
+    MigrateWebPanelDir(StrL("WebView2"), StrL("profile\\Browser-AIChat"));
+    MigrateWebPanelDir(StrL("profile\\WebView2"), StrL("profile\\Browser-AIChat"));
+    MigrateWebPanelDir(StrL("profile\\WebView2-Browser"), StrL("profile\\Browser-Library"));
     // Human-readable layout guide for OneDrive backup.
     TempStr readme = path::JoinTemp(root, StrL("README.txt"));
     if (!file::Exists(readme)) {
         file::WriteFile(readme,
                         StrL("SumatraPDF WebPanel data (unified under %OneDrive%\\SumatraPDF\\WebPanel)\r\n"
                              "\r\n"
-                             "tabs\\             tab session + per-PDF active-tab map\r\n"
-                             "  index.json       open tabs / active tab id\r\n"
-                             "  pdf-map.json     bookId → {webTabId,webTabUrl,notebookTabId,notebookTabUrl}\r\n"
+                             "tabs\\             tab session + per-book active-tab map\r\n"
+                             "  index.json       AI panel open tabs / active tab id\r\n"
+                             "  web-index.json   Library (center) Web open tabs\r\n"
+                             "  pdf-map.json     bookId → AI + browser tab bindings\r\n"
                              "bridge\\           CDP / Playwright bridge state\r\n"
-                             "  web-bridge.json  live endpoint + current PDF context\r\n"
-                             "profile\\          browser profile (cookies / accounts)\r\n"
-                             "  WebView2\\        WebView2 user-data folder\r\n"
+                             "profile\\          independent WebView2 user-data folders\r\n"
+                             "  Browser-AIChat\\  AI panel (CDP 9224)\r\n"
+                             "  Browser-Library\\ center Web (CDP 9225)\r\n"
                              "cache\\            disposable caches\r\n"
-                             "  favicons\\        host favicon PNGs\r\n"
                              "jobs\\             automation queue\r\n"
-                             "  pending|done|failed\r\n"
-                             "bookmarks.txt      AI bookmark list\r\n"));
+                             "bookmarks.txt      AI bookmark list\r\n"
+                             "\r\n"
+                             "Extensions live beside this tree:\r\n"
+                             "  %OneDrive%\\SumatraPDF\\extensions\\installed\\<id>\\plugin.json\r\n"
+                             "  %OneDrive%\\SumatraPDF\\extensions\\installed\\<id>\\manifest.json\r\n"
+                             "  GitHub: https://github.com/tingaidehua/sumatrapdf-browsers-agents\r\n"));
     }
+    EnsureBrowserExtensionsLayout();
 }
 
 static TempStr PreferNewOrLegacyTemp(Str newRel, Str legacyRel) {
@@ -235,7 +247,83 @@ TempStr BridgePathTemp() {
 }
 
 TempStr WebViewProfileDirTemp() {
-    return PreferNewOrLegacyTemp(StrL("profile\\WebView2"), StrL("WebView2"));
+    // AI panel — Browser-AIChat (CDP 9224 / NotebookLM automation).
+    TempStr root = WebPanelDataDirTemp();
+    TempStr neu = path::JoinTemp(root, StrL("profile\\Browser-AIChat"));
+    if (dir::Exists(neu)) {
+        return neu;
+    }
+    return PreferNewOrLegacyTemp(StrL("profile\\Browser-AIChat"), StrL("profile\\WebView2"));
+}
+
+TempStr WebViewBrowserProfileDirTemp() {
+    // Center Library Web — Browser-Library (CDP 9225).
+    TempStr root = WebPanelDataDirTemp();
+    TempStr neu = path::JoinTemp(root, StrL("profile\\Browser-Library"));
+    if (dir::Exists(neu)) {
+        return neu;
+    }
+    return PreferNewOrLegacyTemp(StrL("profile\\Browser-Library"), StrL("profile\\WebView2-Browser"));
+}
+
+TempStr BrowserExtensionsRootDirTemp() {
+    return path::JoinTemp(GetOneDriveAppDataDirTemp(), StrL("extensions"));
+}
+
+TempStr BrowserExtensionsInstalledDirTemp() {
+    return path::JoinTemp(BrowserExtensionsRootDirTemp(), StrL("installed"));
+}
+
+void EnsureBrowserExtensionsLayout() {
+    TempStr root = BrowserExtensionsRootDirTemp();
+    TempStr installed = BrowserExtensionsInstalledDirTemp();
+    dir::CreateAll(installed);
+    TempStr readme = path::JoinTemp(root, StrL("README.txt"));
+    // Always refresh guide so repo rename / layout notes stay current.
+    file::WriteFile(
+        readme,
+        StrL("SumatraPDF browsers / agents — extensions\r\n"
+             "\r\n"
+             "installed\\<id>\\plugin.json   host plugin (native / Playwright action)\r\n"
+             "installed\\<id>\\manifest.json unpacked Chromium extension (WebView2 AddBrowserExtension)\r\n"
+             "\r\n"
+             "plugin.json \"browser\": Browser-AIChat | Browser-Library\r\n"
+             "  (host plugins only appear on that profile's puzzle menu)\r\n"
+             "\r\n"
+             "Built-in host plugins (Browser-AIChat only):\r\n"
+             "  notebooklm-add         添加到 NotebookLM (center PDF/网页)\r\n"
+             "  notebooklm-focus-pdf   仅与当前 PDF/网页 对话\r\n"
+             "\r\n"
+             "Drop Chrome-unpacked extensions under installed\\ for WebView2 profiles\r\n"
+             "Browser-AIChat (CDP 9224) and Browser-Library (CDP 9225).\r\n"
+             "\r\n"
+             "GitHub: https://github.com/tingaidehua/sumatrapdf-browsers-agents\r\n"));
+
+    // Seed / refresh built-in host plugins (plugin.json only — not Chrome CRX).
+    // browser: Browser-AIChat | Browser-Library — which WebView2 toolbar may run them.
+    auto seedHost = [&](Str id, Str name, Str action, Str description, Str browser) {
+        TempStr dir = path::JoinTemp(installed, id);
+        dir::CreateAll(dir);
+        TempStr jsonPath = path::JoinTemp(dir, StrL("plugin.json"));
+        TempStr body =
+            fmt("{\n"
+                "  \"id\": %s,\n"
+                "  \"name\": %s,\n"
+                "  \"kind\": \"host\",\n"
+                "  \"browser\": %s,\n"
+                "  \"action\": %s,\n"
+                "  \"description\": %s\n"
+                "}\n",
+                EscapeJsonTemp(id), EscapeJsonTemp(name), EscapeJsonTemp(browser), EscapeJsonTemp(action),
+                EscapeJsonTemp(description));
+        file::WriteFile(jsonPath, body);
+    };
+    seedHost(StrL("notebooklm-add"), StrL("添加到 NotebookLM"), StrL("notebooklm.add"),
+             StrL("将中间栏当前 PDF 或网页加入 NotebookLM（Playwright / CDP 9224）"),
+             StrL("Browser-AIChat"));
+    seedHost(StrL("notebooklm-focus-pdf"), StrL("仅与当前 PDF 对话"), StrL("notebooklm.focus"),
+             StrL("按图书馆 NotebookLM 记录，仅选中中间栏当前 PDF/网页来源并打开对话"),
+             StrL("Browser-AIChat"));
 }
 
 TempStr FaviconsDirTemp() {
@@ -710,6 +798,9 @@ void SaveWebPanelTabs(MainWindow* win) {
         sb.Append(EscapeJsonTemp(t.url));
         sb.Append(StrL(", \"title\": "));
         sb.Append(EscapeJsonTemp(t.title ? t.title : TitleFromUrlTemp(t.url)));
+        if (t.titleLocked) {
+            sb.Append(StrL(", \"titleLocked\": true"));
+        }
         sb.Append(StrL("}"));
     }
     sb.Append(StrL("\n  ]\n}\n"));
@@ -764,6 +855,8 @@ void LoadWebPanelTabs(MainWindow* win) {
             str::ReplaceWithCopy(&s->cur.url, v->value);
         } else if (str::EndsWithI(p, StrL("/title"))) {
             str::ReplaceWithCopy(&s->cur.title, v->value);
+        } else if (str::EndsWithI(p, StrL("/titleLocked"))) {
+            s->cur.titleLocked = v->value && (str::EqI(v->value, StrL("true")) || str::Eq(v->value, StrL("1")));
         }
     };
     json::Parse(data, MkFunc1<St, json::Value*>(onVal, &st));
@@ -795,10 +888,16 @@ void LoadWebPanelTabs(MainWindow* win) {
 
 struct PdfTabBinding {
     Str bookKey; // decimal book id
+    // AI panel: "当前" + NotebookLM (same for PDF and Web library entries)
     Str webTabId;
     Str webTabUrl;
     Str notebookTabId;
     Str notebookTabUrl;
+    // Center Web browser surface (Web library entries only)
+    Str browserTabId;
+    Str browserTabUrl;
+    // -1 = never set (treat as open, matching historical default); 0 = closed; 1 = open
+    int aiOpen = -1;
 };
 
 static bool IsNotebookLmUrl(Str url) {
@@ -820,6 +919,8 @@ static void FreePdfTabBinding(PdfTabBinding* b) {
     str::Free(b->webTabUrl);
     str::Free(b->notebookTabId);
     str::Free(b->notebookTabUrl);
+    str::Free(b->browserTabId);
+    str::Free(b->browserTabUrl);
     *b = {};
 }
 
@@ -883,6 +984,16 @@ static Vec<PdfTabBinding> LoadAllPdfTabBindings() {
             str::ReplaceWithCopy(&b->notebookTabId, v->value);
         } else if (str::Eq(field, StrL("notebookTabUrl"))) {
             str::ReplaceWithCopy(&b->notebookTabUrl, v->value);
+        } else if (str::Eq(field, StrL("browserTabId"))) {
+            str::ReplaceWithCopy(&b->browserTabId, v->value);
+        } else if (str::Eq(field, StrL("browserTabUrl"))) {
+            str::ReplaceWithCopy(&b->browserTabUrl, v->value);
+        } else if (str::Eq(field, StrL("aiOpen"))) {
+            if (v->value && (str::Eq(v->value, StrL("1")) || str::EqI(v->value, StrL("true")))) {
+                b->aiOpen = 1;
+            } else if (v->value && (str::Eq(v->value, StrL("0")) || str::EqI(v->value, StrL("false")))) {
+                b->aiOpen = 0;
+            }
         }
     };
     json::Parse(data, MkFunc1<St, json::Value*>(onVal, &st));
@@ -899,7 +1010,8 @@ static void SaveAllPdfTabBindings(Vec<PdfTabBinding>& all) {
         if (!b.bookKey) {
             continue;
         }
-        if (!b.webTabId && !b.webTabUrl && !b.notebookTabId && !b.notebookTabUrl) {
+        if (!b.webTabId && !b.webTabUrl && !b.notebookTabId && !b.notebookTabUrl && !b.browserTabId &&
+            !b.browserTabUrl && b.aiOpen < 0) {
             continue;
         }
         if (!first) {
@@ -922,6 +1034,11 @@ static void SaveAllPdfTabBindings(Vec<PdfTabBinding>& all) {
         field(StrL("webTabUrl"), b.webTabUrl);
         field(StrL("notebookTabId"), b.notebookTabId);
         field(StrL("notebookTabUrl"), b.notebookTabUrl);
+        field(StrL("browserTabId"), b.browserTabId);
+        field(StrL("browserTabUrl"), b.browserTabUrl);
+        if (b.aiOpen >= 0) {
+            field(StrL("aiOpen"), b.aiOpen > 0 ? StrL("1") : StrL("0"));
+        }
         out.Append(StrL("\n  }"));
     }
     out.Append(StrL("\n}\n"));
@@ -950,13 +1067,17 @@ static PdfTabBinding LoadPdfTabBindingForBook(i64 bookId) {
         out.webTabUrl = str::Dup(found->webTabUrl);
         out.notebookTabId = str::Dup(found->notebookTabId);
         out.notebookTabUrl = str::Dup(found->notebookTabUrl);
+        out.browserTabId = str::Dup(found->browserTabId);
+        out.browserTabUrl = str::Dup(found->browserTabUrl);
+        out.aiOpen = found->aiOpen;
     }
     FreeAllPdfTabBindings(all);
     return out;
 }
 
 static void UpsertPdfTabBinding(i64 bookId, Str webTabId, Str webTabUrl, Str notebookTabId, Str notebookTabUrl,
-                                bool setWeb, bool setNotebook, bool clearIds, bool clearUrls) {
+                                bool setWeb, bool setNotebook, bool clearIds, bool clearUrls,
+                                Str browserTabId = {}, Str browserTabUrl = {}, bool setBrowser = false) {
     if (bookId <= 0) {
         return;
     }
@@ -972,14 +1093,18 @@ static void UpsertPdfTabBinding(i64 bookId, Str webTabId, Str webTabUrl, Str not
     if (clearIds) {
         str::Free(b->webTabId);
         str::Free(b->notebookTabId);
+        str::Free(b->browserTabId);
         b->webTabId = {};
         b->notebookTabId = {};
+        b->browserTabId = {};
     }
     if (clearUrls) {
         str::Free(b->webTabUrl);
         str::Free(b->notebookTabUrl);
+        str::Free(b->browserTabUrl);
         b->webTabUrl = {};
         b->notebookTabUrl = {};
+        b->browserTabUrl = {};
     }
     if (setWeb) {
         if (webTabId) {
@@ -997,6 +1122,105 @@ static void UpsertPdfTabBinding(i64 bookId, Str webTabId, Str webTabUrl, Str not
             str::ReplaceWithCopy(&b->notebookTabUrl, notebookTabUrl);
         }
     }
+    if (setBrowser) {
+        if (browserTabId) {
+            str::ReplaceWithCopy(&b->browserTabId, browserTabId);
+        }
+        if (browserTabUrl) {
+            str::ReplaceWithCopy(&b->browserTabUrl, browserTabUrl);
+        }
+    }
+    SaveAllPdfTabBindings(all);
+    FreeAllPdfTabBindings(all);
+}
+
+static void SetBookAiPanelOpen(i64 bookId, bool open) {
+    if (bookId <= 0) {
+        return;
+    }
+    TempStr key = fmt("%lld", bookId);
+    Vec<PdfTabBinding> all = LoadAllPdfTabBindings();
+    PdfTabBinding* b = FindPdfTabBinding(&all, key);
+    if (!b) {
+        PdfTabBinding nb{};
+        nb.bookKey = str::Dup(key);
+        all.Append(nb);
+        b = &all.Last();
+    }
+    b->aiOpen = open ? 1 : 0;
+    SaveAllPdfTabBindings(all);
+    FreeAllPdfTabBindings(all);
+}
+
+static bool BookWantsAiPanelOpen(i64 bookId) {
+    if (bookId <= 0) {
+        return true; // historical default: AI sidebar open
+    }
+    PdfTabBinding bind = LoadPdfTabBindingForBook(bookId);
+    bool want = bind.aiOpen != 0; // -1 or 1 → open; 0 → closed
+    FreePdfTabBinding(&bind);
+    return want;
+}
+
+static void ApplyBookAiPanelVisibility(MainWindow* win, i64 bookId, LibraryBookKind kind) {
+    if (!win || bookId <= 0) {
+        return;
+    }
+    bool want = BookWantsAiPanelOpen(bookId);
+    if (want) {
+        if (win->CurrentTab()) {
+            AIChatSetTabPanelOpen(win->CurrentTab(), AIChatBackend::None);
+            AIChatSyncPanelsToCurrentTab(win);
+        }
+        win->uiState.aiChatVisible = false;
+        win->uiState.webPanelVisible = true;
+        EnsureWebPanelWebView(win);
+        RestoreBookAiBindings(win, bookId, kind);
+    } else if (win->uiState.webPanelVisible) {
+        // Close without rewriting aiOpen (already stored for this book).
+        win->uiState.webPanelVisible = false;
+        for (int i = 0; i < len(win->webPanelTabs); i++) {
+            WebviewWnd* wv = win->webPanelTabs[i].wv;
+            if (!wv) {
+                continue;
+            }
+            wv->SetControllerVisible(false, false);
+        }
+    }
+}
+
+// One-shot: older builds stored the center browser tab in webTab* for Web books.
+static void MigrateLegacyWebBrowserBinding(PdfTabBinding* bind, i64 bookId) {
+    if (!bind || bookId <= 0) {
+        return;
+    }
+    if (bind->browserTabId || bind->browserTabUrl) {
+        return;
+    }
+    if (!bind->webTabId && !bind->webTabUrl) {
+        return;
+    }
+    TempStr key = fmt("%lld", bookId);
+    Vec<PdfTabBinding> all = LoadAllPdfTabBindings();
+    PdfTabBinding* b = FindPdfTabBinding(&all, key);
+    if (!b) {
+        PdfTabBinding nb{};
+        nb.bookKey = str::Dup(key);
+        all.Append(nb);
+        b = &all.Last();
+    }
+    str::ReplaceWithCopy(&b->browserTabId, bind->webTabId);
+    str::ReplaceWithCopy(&b->browserTabUrl, bind->webTabUrl);
+    str::Free(b->webTabId);
+    str::Free(b->webTabUrl);
+    b->webTabId = {};
+    b->webTabUrl = {};
+    str::ReplaceWithCopy(&bind->browserTabId, b->browserTabId);
+    str::ReplaceWithCopy(&bind->browserTabUrl, b->browserTabUrl);
+    str::Free(bind->webTabId);
+    str::Free(bind->webTabUrl);
+    bind->webTabId = {};
+    bind->webTabUrl = {};
     SaveAllPdfTabBindings(all);
     FreeAllPdfTabBindings(all);
 }
@@ -1037,20 +1261,27 @@ void RememberPdfActiveTab(MainWindow* win) {
     if (!win || win->webPanelActiveTab < 0 || win->webPanelActiveTab >= len(win->webPanelTabs)) {
         return;
     }
-    WindowTab* tab = win->CurrentTab();
-    if (!tab || !tab->filePath || !LibraryIsAvailable()) {
+    if (!LibraryIsAvailable()) {
         return;
     }
-    LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
-    if (!book) {
-        return;
+    i64 bookId = win->activeLibraryBookId;
+    LibraryBook* book = nullptr;
+    if (bookId <= 0) {
+        WindowTab* tab = win->CurrentTab();
+        if (!tab || !tab->filePath) {
+            return;
+        }
+        book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
+        if (!book) {
+            return;
+        }
+        bookId = book->id;
     }
     WebPanelTab& t = win->webPanelTabs[win->webPanelActiveTab];
-    // Always remember the currently displayed WebView tab (by stable id + full url).
-    UpsertPdfTabBinding(book->id, t.id, t.url, {}, {}, true, false, false, false);
-    // Separately remember NotebookLM slot when this tab is a NotebookLM page.
+    // AI panel tabs are per library entry (PDF and Web alike).
+    UpsertPdfTabBinding(bookId, t.id, t.url, {}, {}, true, false, false, false);
     if (IsNotebookLmUrl(t.url)) {
-        UpsertPdfTabBinding(book->id, {}, {}, t.id, t.url, false, true, false, false);
+        UpsertPdfTabBinding(bookId, {}, {}, t.id, t.url, false, true, false, false);
     }
     DeleteLibraryBook(book);
     SaveWebPanelTabs(win);
@@ -1060,18 +1291,42 @@ void RestorePdfActiveTab(MainWindow* win) {
     if (!win || !LibraryIsAvailable()) {
         return;
     }
-    WindowTab* tab = win->CurrentTab();
-    if (!tab || !tab->filePath) {
-        return;
+    i64 bookId = win->activeLibraryBookId;
+    if (bookId <= 0) {
+        WindowTab* tab = win->CurrentTab();
+        if (!tab || !tab->filePath) {
+            return;
+        }
+        LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
+        if (!book) {
+            return;
+        }
+        bookId = book->id;
+        DeleteLibraryBook(book);
     }
-    LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
-    if (!book) {
-        return;
-    }
-    PdfTabBinding bind = LoadPdfTabBindingForBook(book->id);
-    DeleteLibraryBook(book);
+    PdfTabBinding bind = LoadPdfTabBindingForBook(bookId);
     // Prefer stable tab id; fall back to saved URL if the tab was closed from the menu.
     ActivateOrRecreateWebPanelTab(win, bind.webTabId, bind.webTabUrl, TitleFromUrlTemp(bind.webTabUrl), false);
+    FreePdfTabBinding(&bind);
+}
+
+void RestoreBookAiBindings(MainWindow* win, i64 bookId, LibraryBookKind kind) {
+    if (!win || bookId <= 0 || !win->uiState.webPanelVisible) {
+        return;
+    }
+    PdfTabBinding bind = LoadPdfTabBindingForBook(bookId);
+    if (kind == LibraryBookKind::Web) {
+        MigrateLegacyWebBrowserBinding(&bind, bookId);
+    }
+    // Prefer last AI "当前" tab; fall back to NotebookLM if that is all we have.
+    if (bind.webTabId || bind.webTabUrl) {
+        ActivateOrRecreateWebPanelTab(win, bind.webTabId, bind.webTabUrl, TitleFromUrlTemp(bind.webTabUrl), false);
+    } else if (bind.notebookTabId || bind.notebookTabUrl) {
+        ActivateOrRecreateWebPanelTab(win, bind.notebookTabId, bind.notebookTabUrl, StrL("NotebookLM"), false);
+    } else {
+        // First open for this book — land on NotebookLM so the AI pane is never blank.
+        ActivateOrRecreateWebPanelTab(win, {}, StrL("https://notebook.google.com/"), StrL("NotebookLM"), false);
+    }
     FreePdfTabBinding(&bind);
 }
 
@@ -1161,6 +1416,20 @@ void ShowActiveWebPanelTab(MainWindow* win) {
     if (!win || !win->webPanelWebViewSlot) {
         return;
     }
+    if (!win->uiState.webPanelVisible) {
+        for (int i = 0; i < len(win->webPanelTabs); i++) {
+            WebviewWnd* wv = win->webPanelTabs[i].wv;
+            if (!wv) {
+                continue;
+            }
+            wv->SetControllerVisible(false);
+            wv->SetIsVisible(false);
+            if (wv->hwnd) {
+                ShowWindow(wv->hwnd, SW_HIDE);
+            }
+        }
+        return;
+    }
     Rect wr = win->webPanelWebViewSlot->lastBounds;
     if (wr.dx < 1) {
         wr.dx = 1;
@@ -1221,12 +1490,15 @@ WebviewWnd* CreateWebPanelTabWebView(MainWindow* win, Str url) {
     webView->dataDir = str::Dup(WebViewProfileDirTemp());
     webView->useDedicatedEnvironment = true;
     webView->enableDevTools = true;
+    webView->defaultBackgroundColor = kColWhite;
     webView->emulateMobile = true;
     webView->mobileDeviceWidth = 0;
     webView->mobileDeviceHeight = 0;
     webView->mobileDeviceScale = 1.0f;
     webView->userAgent = str::Dup(kMobileUserAgent);
     webView->dedicatedBrowserArgs = str::Dup(fmt("--remote-debugging-port=%d", port));
+    webView->enableBrowserExtensions = true;
+    webView->browserExtensionsDir = str::Dup(BrowserExtensionsInstalledDirTemp());
     webView->allowClipboardRead = true;
     webView->desiredVisible = false;
     webView->AddInitScript(kMobileViewportScript);
@@ -1386,8 +1658,43 @@ void OnFocusCurrentPdfNotebookLm(MainWindow* win) {
     if (!win) {
         return;
     }
+    // Center Web (middle pane) XOR PDF — same scope as "添加到 NotebookLM".
+    if (win->uiState.webBrowserVisible) {
+        TempStr url = win->webBrowserCurrentUrl;
+        TempStr title = {};
+        if (win->webBrowserActiveTab >= 0 && win->webBrowserActiveTab < len(win->webBrowserTabs)) {
+            WebPanelTab& t = win->webBrowserTabs[win->webBrowserActiveTab];
+            if (!url && t.url) {
+                url = str::DupTemp(t.url);
+            }
+            if (t.title) {
+                title = str::DupTemp(t.title);
+            }
+        }
+        if (!url || str::EqI(url, StrL("about:blank"))) {
+            MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("请先在中间栏打开一个网页。")),
+                        CWStrTemp(_TRA("仅与当前来源对话")), MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        i64 bookId = win->activeLibraryBookId > 0 ? win->activeLibraryBookId : 0;
+        if (bookId <= 0 && LibraryIsAvailable()) {
+            LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), url);
+            if (book) {
+                bookId = book->id;
+                if ((!title || !title.len) && book->title) {
+                    title = str::DupTemp(book->title);
+                }
+                DeleteLibraryBook(book);
+            }
+        }
+        TempStr srcTitle = title ? title : TitleFromUrlTemp(url);
+        WebPanelSelectNotebookLmSource(win, bookId, url, srcTitle);
+        return;
+    }
     WindowTab* tab = win->CurrentTab();
     if (!tab || !tab->filePath) {
+        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("请先在中间栏打开一个 PDF 或网页。")),
+                    CWStrTemp(_TRA("仅与当前来源对话")), MB_OK | MB_ICONINFORMATION);
         return;
     }
     i64 bookId = 0;
@@ -2069,6 +2376,263 @@ void OnTabsButton(MainWindow* win) {
     ShowTabsMenu(win);
 }
 
+// WebView2 / Edge Chromium history (equivalent to Chrome chrome://history/).
+void OnWebPanelHistoryButton(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    win->uiState.aiChatVisible = false;
+    win->uiState.webPanelVisible = true;
+    EnsureWebPanelWebView(win);
+    CreateNewWebPanelTab(win, StrL("edge://history/"), _TRA("历史记录"));
+    ScheduleUiUpdate(win);
+}
+
+void OnNotebookLmTabButton(MainWindow* win);
+void OnFocusCurrentPdfNotebookLm(MainWindow* win);
+
+struct BrowserPluginEntry {
+    Str id;
+    Str name;
+    Str kind;    // "host" | "webview2"
+    Str browser; // "Browser-AIChat" | "Browser-Library" | empty (= all)
+    Str action;  // host action id
+    Str folder;
+};
+
+static void FreeBrowserPluginEntry(BrowserPluginEntry* e) {
+    if (!e) {
+        return;
+    }
+    str::Free(e->id);
+    str::Free(e->name);
+    str::Free(e->kind);
+    str::Free(e->browser);
+    str::Free(e->action);
+    str::Free(e->folder);
+    *e = {};
+}
+
+static TempStr ReadPluginJsonFieldTemp(Str json, Str field) {
+    if (!json || !field) {
+        return {};
+    }
+    struct St {
+        Str field;
+        Str out;
+    } st{field};
+    auto onVal = [](St* s, json::Value* v) {
+        if (v->type != json::Type::String || !v->value) {
+            return;
+        }
+        TempStr seg = str::JoinTemp(StrL("/"), s->field);
+        if (json::PathMatch(v->path, seg)) {
+            str::ReplaceWithCopy(&s->out, v->value);
+            v->stop = true;
+        }
+    };
+    json::Parse(json, MkFunc1<St, json::Value*>(onVal, &st));
+    TempStr res = st.out ? str::DupTemp(st.out) : TempStr{};
+    str::Free(st.out);
+    return res;
+}
+
+static void CollectInstalledPlugins(Vec<BrowserPluginEntry>* out, Str browserFilter) {
+    if (!out) {
+        return;
+    }
+    EnsureBrowserExtensionsLayout();
+    TempStr installed = BrowserExtensionsInstalledDirTemp();
+    DirIter di{installed};
+    di.includeDirs = true;
+    di.includeFiles = false;
+    for (DirIterEntry* de : di) {
+        if (!de || !de->isDir || !de->name) {
+            continue;
+        }
+        TempStr pluginJsonPath = path::JoinTemp(de->filePath, StrL("plugin.json"));
+        TempStr manifestPath = path::JoinTemp(de->filePath, StrL("manifest.json"));
+        BrowserPluginEntry e{};
+        e.folder = str::Dup(de->filePath);
+        e.id = str::Dup(de->name);
+        if (file::Exists(pluginJsonPath)) {
+            Str raw = file::ReadFile(pluginJsonPath);
+            TempStr name = ReadPluginJsonFieldTemp(raw, StrL("name"));
+            TempStr kind = ReadPluginJsonFieldTemp(raw, StrL("kind"));
+            TempStr action = ReadPluginJsonFieldTemp(raw, StrL("action"));
+            TempStr id = ReadPluginJsonFieldTemp(raw, StrL("id"));
+            TempStr browser = ReadPluginJsonFieldTemp(raw, StrL("browser"));
+            str::Free(raw);
+            if (id) {
+                str::ReplaceWithCopy(&e.id, id);
+            }
+            e.name = str::Dup(name ? name : de->name);
+            e.kind = str::Dup(kind ? kind : StrL("host"));
+            e.browser = str::Dup(browser);
+            e.action = str::Dup(action);
+            // Host plugins: require matching browser (default Browser-AIChat if omitted).
+            TempStr want = e.browser ? e.browser : StrL("Browser-AIChat");
+            if (browserFilter && !str::EqI(want, browserFilter)) {
+                FreeBrowserPluginEntry(&e);
+                continue;
+            }
+            out->Append(e);
+            continue;
+        }
+        if (file::Exists(manifestPath)) {
+            // Unpacked Chromium extensions are available to both profiles for now.
+            e.name = str::Dup(de->name);
+            e.kind = str::Dup(StrL("webview2"));
+            out->Append(e);
+            continue;
+        }
+        FreeBrowserPluginEntry(&e);
+    }
+}
+
+// Resolve middle-pane target for NotebookLM host plugins: center Web XOR PDF.
+static bool ResolveCenterNotebookLmTarget(MainWindow* win, i64* bookIdOut, TempStr* pdfPathOut, TempStr* sourceUrlOut,
+                                          TempStr* titleOut) {
+    if (!win || !bookIdOut || !pdfPathOut || !sourceUrlOut || !titleOut) {
+        return false;
+    }
+    *bookIdOut = 0;
+    *pdfPathOut = {};
+    *sourceUrlOut = {};
+    *titleOut = {};
+
+    if (win->uiState.webBrowserVisible) {
+        TempStr url = win->webBrowserCurrentUrl;
+        TempStr title = {};
+        if (win->webBrowserActiveTab >= 0 && win->webBrowserActiveTab < len(win->webBrowserTabs)) {
+            WebPanelTab& t = win->webBrowserTabs[win->webBrowserActiveTab];
+            if (!url && t.url) {
+                url = str::DupTemp(t.url);
+            }
+            if (t.title) {
+                title = str::DupTemp(t.title);
+            }
+        }
+        if (!url || str::EqI(url, StrL("about:blank")) || str::StartsWithI(url, StrL("edge://"))) {
+            return false;
+        }
+        *sourceUrlOut = url;
+        *titleOut = title ? title : TitleFromUrlTemp(url);
+        if (win->activeLibraryBookId > 0) {
+            *bookIdOut = win->activeLibraryBookId;
+        } else if (LibraryIsAvailable()) {
+            LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), url);
+            if (!book) {
+                // Web books may store url separately; path can still be the URL key.
+                book = LibraryStoreFindBookByPath(LibraryGetStore(), url);
+            }
+            if (book) {
+                *bookIdOut = book->id;
+                if ((!title || !title.len) && book->title) {
+                    *titleOut = str::DupTemp(book->title);
+                }
+                DeleteLibraryBook(book);
+            }
+        }
+        return true;
+    }
+
+    WindowTab* tab = win->CurrentTab();
+    if (!tab || !tab->filePath || !str::EndsWithI(tab->filePath, StrL(".pdf"))) {
+        return false;
+    }
+    *pdfPathOut = str::DupTemp(tab->filePath);
+    *titleOut = path::GetBaseNameTemp(tab->filePath);
+    if (LibraryIsAvailable()) {
+        LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
+        if (book) {
+            *bookIdOut = book->id;
+            DeleteLibraryBook(book);
+        }
+    }
+    return true;
+}
+
+static void RunHostPluginAction(MainWindow* win, Str action) {
+    if (!win || !action) {
+        return;
+    }
+    if (str::Eq(action, StrL("notebooklm.focus"))) {
+        OnFocusCurrentPdfNotebookLm(win);
+        return;
+    }
+    if (str::Eq(action, StrL("notebooklm.open-tab"))) {
+        OnNotebookLmTabButton(win);
+        return;
+    }
+    if (str::Eq(action, StrL("notebooklm.add"))) {
+        i64 bookId = 0;
+        TempStr pdfPath = {};
+        TempStr sourceUrl = {};
+        TempStr title = {};
+        if (!ResolveCenterNotebookLmTarget(win, &bookId, &pdfPath, &sourceUrl, &title)) {
+            MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("请先在中间栏打开一个 PDF 或网页。")),
+                        CWStrTemp(_TRA("添加到 NotebookLM")), MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        WebPanelAddToNotebookLm(win, bookId, pdfPath, sourceUrl, title);
+        return;
+    }
+    logf("RunHostPluginAction: unknown action '%s'\n", action);
+}
+
+void ShowBrowserExtensionsMenu(MainWindow* win, Str browserProfile) {
+    if (!win) {
+        return;
+    }
+    EnsureBrowserExtensionsLayout();
+    Vec<BrowserPluginEntry> plugins;
+    CollectInstalledPlugins(&plugins, browserProfile);
+
+    HMENU menu = CreatePopupMenu();
+    constexpr UINT kManageId = 9000;
+    for (int i = 0; i < len(plugins); i++) {
+        TempStr label = plugins[i].name ? plugins[i].name : plugins[i].id;
+        if (plugins[i].kind && str::Eq(plugins[i].kind, StrL("webview2"))) {
+            label = fmt("🧩 %s", label);
+        }
+        AppendMenuW(menu, MF_STRING, (UINT)(i + 1), CWStrTemp(label));
+    }
+    if (len(plugins) == 0) {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CWStrTemp(_TRA("(尚未安装扩展)")));
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kManageId, CWStrTemp(_TRA("管理扩展程序")));
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    DestroyMenu(menu);
+
+    if (cmd == (int)kManageId) {
+        TempStr root = BrowserExtensionsRootDirTemp();
+        SumatraOpenPathInDefaultFileManager(root);
+    } else if (cmd >= 1 && cmd <= len(plugins)) {
+        BrowserPluginEntry& e = plugins[cmd - 1];
+        if (e.kind && str::Eq(e.kind, StrL("host")) && e.action) {
+            RunHostPluginAction(win, e.action);
+        } else if (e.folder) {
+            SumatraOpenPathInDefaultFileManager(e.folder);
+        }
+    }
+    for (BrowserPluginEntry& e : plugins) {
+        FreeBrowserPluginEntry(&e);
+    }
+}
+
+void OnWebPanelExtensionsButton(MainWindow* win) {
+    ShowBrowserExtensionsMenu(win, StrL("Browser-AIChat"));
+}
+
+void OnWebBrowserExtensionsButton(MainWindow* win) {
+    ShowBrowserExtensionsMenu(win, StrL("Browser-Library"));
+}
+
 void OnNotebookLmTabButton(MainWindow* win) {
     if (!win) {
         return;
@@ -2113,8 +2677,21 @@ bool OnWebNavStarting(void* ctx, Str url, bool newWindow) {
         return true;
     }
     if (newWindow && url) {
-        // Popup / target=_blank → new tab (keep existing tabs).
+        // AI panel only: popup / target=_blank → new AI tab.
         CreateNewWebPanelTab(win, url, TitleFromUrlTemp(url));
+        return false;
+    }
+    return true;
+}
+
+// Center Web: never route into AI. New windows become library web books.
+bool OnWebBrowserNavStarting(void* ctx, Str url, bool newWindow) {
+    auto* win = (MainWindow*)ctx;
+    if (!IsMainWindowValid(win)) {
+        return true;
+    }
+    if (newWindow && url) {
+        LibraryOpenWebUrlInBrowser(win, url);
         return false;
     }
     return true;
@@ -2128,6 +2705,9 @@ void OnWebNavCompleted(void* ctx, Str url, bool success) {
     WebviewWnd* wv = win->webPanelWebView;
     TempStr title = wv ? wv->GetDocumentTitleTemp() : TempStr{};
     SyncWebPanelTabFromWebView(win, wv, url, title);
+    if (!win->uiState.webPanelVisible) {
+        return;
+    }
     if (win->webPanelWebView) {
         win->webPanelWebView->SetControllerVisible(true);
         if (win->webPanelWebView->emulateMobile) {
@@ -2155,10 +2735,8 @@ void SyncWebPanelTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str ti
         return;
     }
     int idx = FindWebPanelTabByWebView(win, wv);
-    if (idx < 0) {
-        idx = win->webPanelActiveTab;
-    }
     if (idx < 0 || idx >= len(win->webPanelTabs)) {
+        // Browser-surface WebViews must not fall through to the AI active tab.
         return;
     }
     WebPanelTab& t = win->webPanelTabs[idx];
@@ -2175,8 +2753,9 @@ void SyncWebPanelTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str ti
     }
     if (title && title.len > 0) {
         // Prefer the live document.title (Chrome tab label); skip empty / URL-looking fallbacks.
+        // After a user rename, titleLocked freezes the label.
         bool titleIsUrl = str::StartsWithI(title, StrL("http://")) || str::StartsWithI(title, StrL("https://"));
-        if (!titleIsUrl && !str::Eq(t.title, title)) {
+        if (!t.titleLocked && !titleIsUrl && !str::Eq(t.title, title)) {
             str::ReplaceWithCopy(&t.title, title);
             changed = true;
         }
@@ -2277,6 +2856,116 @@ void WebPanelClearPdfTabUrls(i64 bookId) {
     UpsertPdfTabBinding(bookId, {}, {}, {}, {}, false, false, false, true);
 }
 
+void WebPanelShowAiTabBindings(MainWindow* win, i64 bookId) {
+    if (bookId <= 0) {
+        return;
+    }
+    HWND parent = win ? win->hwndFrame : nullptr;
+    PdfTabBinding bind = LoadPdfTabBindingForBook(bookId);
+    LibraryBook* book = LibraryIsAvailable() ? LibraryStoreFindBookById(LibraryGetStore(), bookId) : nullptr;
+    if (book && book->kind == LibraryBookKind::Web) {
+        MigrateLegacyWebBrowserBinding(&bind, bookId);
+    }
+
+    str::Builder out;
+    out.Append(fmt("bookId:           %lld\n", bookId));
+    out.Append(fmt("kind:             %s\n",
+                   book && book->kind == LibraryBookKind::Web ? StrL("web") : StrL("pdf")));
+    out.Append(fmt("title:            %s\n", book && book->title ? book->title : StrL("")));
+    out.Append(StrL("\n=== AI 面板 · 当前 Tab ===\n"));
+    out.Append(fmt("webTabId:         %s\n", bind.webTabId ? bind.webTabId : StrL("(empty)")));
+    out.Append(fmt("webTabUrl:        %s\n", bind.webTabUrl ? bind.webTabUrl : StrL("(empty)")));
+    out.Append(StrL("\n=== AI 面板 · NotebookLM Tab ===\n"));
+    out.Append(fmt("notebookTabId:    %s\n", bind.notebookTabId ? bind.notebookTabId : StrL("(empty)")));
+    out.Append(fmt("notebookTabUrl:   %s\n", bind.notebookTabUrl ? bind.notebookTabUrl : StrL("(empty)")));
+    if (book && book->kind == LibraryBookKind::Web) {
+        out.Append(StrL("\n=== 中间网页 · Browser Tab ===\n"));
+        out.Append(fmt("browserTabId:     %s\n", bind.browserTabId ? bind.browserTabId : StrL("(empty)")));
+        out.Append(fmt("browserTabUrl:    %s\n", bind.browserTabUrl ? bind.browserTabUrl : StrL("(empty)")));
+    }
+    out.Append(StrL("\n文件: %OneDrive%\\SumatraPDF\\WebPanel\\tabs\\pdf-map.json\n"));
+    DeleteLibraryBook(book);
+
+    constexpr int kBtnClearIds = 1001;
+    constexpr int kBtnClearUrls = 1002;
+    struct DlgState {
+        Str text;
+    } state;
+    state.text = str::Dup(ToStr(out));
+
+#pragma pack(push, 1)
+    struct {
+        DLGTEMPLATE dlg;
+        WORD menu;
+        WORD cls;
+        WCHAR title[1];
+    } tmpl{};
+#pragma pack(pop)
+    tmpl.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER;
+    tmpl.dlg.dwExtendedStyle = WS_EX_DLGMODALFRAME;
+    tmpl.dlg.cx = 420;
+    tmpl.dlg.cy = 260;
+
+    auto proc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> INT_PTR {
+        auto* st = (DlgState*)GetWindowLongPtrW(hwnd, DWLP_USER);
+        if (msg == WM_INITDIALOG) {
+            st = (DlgState*)lp;
+            SetWindowLongPtrW(hwnd, DWLP_USER, (LONG_PTR)st);
+            SetWindowTextW(hwnd, CWStrTemp(_TRA("伴随 AI Tab 页")));
+            HFONT font = GetAppFont()->GetHFont();
+            Rect rc = HwndClientRect(hwnd);
+            HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, CWStrTemp(st->text),
+                                       WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
+                                           ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                                       10, 10, rc.dx - 20, rc.dy - 52, hwnd, (HMENU)1000, GetModuleHandleW(nullptr),
+                                       nullptr);
+            HWND b1 = CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("删除 Tab ID")), WS_CHILD | WS_VISIBLE | WS_TABSTOP, 10,
+                                   rc.dy - 34, 100, 26, hwnd, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
+            HWND b2 = CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("删除 Tab URL")), WS_CHILD | WS_VISIBLE | WS_TABSTOP, 118,
+                                   rc.dy - 34, 110, 26, hwnd, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+            HWND b3 = CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("关闭")),
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, rc.dx - 88, rc.dy - 34, 78, 26,
+                                   hwnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+            for (HWND c : {edit, b1, b2, b3}) {
+                SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+            }
+            return TRUE;
+        }
+        if (msg == WM_COMMAND) {
+            int id = LOWORD(wp);
+            if (id == 1001 || id == 1002) {
+                EndDialog(hwnd, id);
+                return TRUE;
+            }
+            if (id == IDCANCEL || id == IDOK) {
+                EndDialog(hwnd, IDCANCEL);
+                return TRUE;
+            }
+        }
+        if (msg == WM_CLOSE) {
+            EndDialog(hwnd, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    };
+
+    INT_PTR result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &tmpl.dlg, parent, proc, (LPARAM)&state);
+    str::Free(state.text);
+    FreePdfTabBinding(&bind);
+
+    if (result == kBtnClearIds) {
+        if (MessageBoxW(parent, CWStrTemp(_TRA("确定删除该条目记录的全部 Tab ID？")), CWStrTemp(_TRA("删除 Tab ID")),
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            WebPanelClearPdfTabIds(bookId);
+        }
+    } else if (result == kBtnClearUrls) {
+        if (MessageBoxW(parent, CWStrTemp(_TRA("确定删除该条目记录的全部 Tab URL？")), CWStrTemp(_TRA("删除 Tab URL")),
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            WebPanelClearPdfTabUrls(bookId);
+        }
+    }
+}
+
 void RelayoutWebPanel(MainWindow* win) {
     if (!win || !win->hwndWebPanelBox) {
         return;
@@ -2286,6 +2975,24 @@ void RelayoutWebPanel(MainWindow* win) {
         win->webPanelWebView->UpdateWebviewSize();
     }
     RedrawWindow(win->hwndWebPanelBox, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+void DeferredApplyLastBookAi(MainWindow* win) {
+    if (!IsMainWindowValid(win) || win->activeLibraryBookId <= 0) {
+        return;
+    }
+    LibraryBookKind kind = (LibraryBookKind)win->activeLibraryBookKind;
+    if (LibraryIsAvailable()) {
+        LibraryBook* book = LibraryStoreFindBookById(LibraryGetStore(), win->activeLibraryBookId);
+        if (book) {
+            kind = book->kind;
+            win->activeLibraryBookKind = (int)kind;
+            DeleteLibraryBook(book);
+        }
+    }
+    ApplyBookAiPanelVisibility(win, win->activeLibraryBookId, kind);
+    win->uiState.layout = {};
+    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
 }
 
 void CreateWebPanel(MainWindow* win) {
@@ -2309,19 +3016,25 @@ void CreateWebPanel(MainWindow* win) {
     win->webPanelBookmarksBtn = HeaderIconButton(gIconBookmarks, _TRA("书签（点击新建 Tab）"),
                                                  MkFunc0(OnBookmarksButton, win));
     win->webPanelTabsBtn = HeaderIconButton(gIconTabs, _TRA("Tab 列表"), MkFunc0(OnTabsButton, win));
+    win->webPanelHistoryBtn =
+        HeaderIconButton(gIconHistory, _TRA("历史记录"), MkFunc0(OnWebPanelHistoryButton, win));
+    win->webPanelExtensionsBtn =
+        HeaderIconButton(gIconExtensions, _TRA("扩展程序"), MkFunc0(OnWebPanelExtensionsButton, win));
     win->webPanelNotebookLmBtn =
         HeaderIconButton(gIconNotebookLm, _TRA("当前 PDF 的 NotebookLM Tab"), MkFunc0(OnNotebookLmTabButton, win));
     win->webPanelFocusPdfBtn =
         HeaderIconButton(gIconTargetFocus, _TRA("仅与当前 PDF 对话"), MkFunc0(OnFocusCurrentPdfNotebookLm, win));
     win->webPanelRefreshBtn = HeaderIconButton(kIconRefresh, _TRA("Refresh"), MkFunc0(OnWebPanelRefresh, win));
 
-    // AI | bookmarks | tabs | notebooklm | focus-pdf | (spacer) | refresh | close
+    // AI | bookmarks | tabs | history | extensions | notebooklm | focus-pdf | (spacer) | refresh | close
     if (len(header.box->children) > 0) {
         header.box->children[0].flex = 0;
         header.box->children.Pop();
     }
     header.box->AddChild(win->webPanelBookmarksBtn);
     header.box->AddChild(win->webPanelTabsBtn);
+    header.box->AddChild(win->webPanelHistoryBtn);
+    header.box->AddChild(win->webPanelExtensionsBtn);
     header.box->AddChild(win->webPanelNotebookLmBtn);
     header.box->AddChild(win->webPanelFocusPdfBtn);
     header.box->AddChild(new Spacer(0, 0), 1);
@@ -2356,10 +3069,10 @@ void CreateWebPanel(MainWindow* win) {
         win->webPanelSplitter->onMove = MkFunc1Void(OnWebPanelSplitterMove);
     }
 
-    // default open; defer WebView2 so the main window can Show immediately
-    win->uiState.webPanelVisible = true;
+    // Per-book AI open/closed is restored after layout (lastBookId / session doc).
+    win->uiState.webPanelVisible = false;
     win->uiState.aiChatVisible = false;
-    uitask::Post(MkFunc0(DeferredEnsureWebPanelWebView, win), "EnsureWebPanelWebView");
+    uitask::Post(MkFunc0(DeferredApplyLastBookAi, win), "ApplyLastBookAi");
 }
 
 void DestroyWebPanel(MainWindow* win) {
@@ -2390,6 +3103,8 @@ void DestroyWebPanel(MainWindow* win) {
     win->webPanelLabel = nullptr;
     win->webPanelBookmarksBtn = nullptr;
     win->webPanelTabsBtn = nullptr;
+    win->webPanelHistoryBtn = nullptr;
+    win->webPanelExtensionsBtn = nullptr;
     win->webPanelNotebookLmBtn = nullptr;
     win->webPanelFocusPdfBtn = nullptr;
     win->webPanelRefreshBtn = nullptr;
@@ -2410,8 +3125,27 @@ void CloseWebPanel(MainWindow* win) {
     if (!win) {
         return;
     }
+    if (win->activeLibraryBookId > 0) {
+        SetBookAiPanelOpen(win->activeLibraryBookId, false);
+    }
     win->uiState.webPanelVisible = false;
-    ScheduleUiUpdate(win);
+    // Drop WebView2 composition so it cannot steal space / paint over the center.
+    for (int i = 0; i < len(win->webPanelTabs); i++) {
+        WebviewWnd* wv = win->webPanelTabs[i].wv;
+        if (!wv) {
+            continue;
+        }
+        wv->SetControllerVisible(false, false);
+        wv->SetIsVisible(false);
+        if (wv->hwnd) {
+            ShowWindow(wv->hwnd, SW_HIDE);
+        }
+    }
+    if (win->hwndWebPanelBox) {
+        HwndSetVisible(win->hwndWebPanelBox, false);
+    }
+    win->uiState.layout = {};
+    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
 }
 
 // Forward decls used by WebPanelOnDocumentChanged (defined below).
@@ -2433,16 +3167,38 @@ void OnWebPanelToggle(MainWindow* win) {
     AIChatSyncPanelsToCurrentTab(win);
     win->uiState.aiChatVisible = false;
     win->uiState.webPanelVisible = true;
+    if (win->activeLibraryBookId > 0) {
+        SetBookAiPanelOpen(win->activeLibraryBookId, true);
+    }
     EnsureWebPanelWebView(win);
+    if (win->activeLibraryBookId > 0) {
+        RestoreBookAiBindings(win, win->activeLibraryBookId, (LibraryBookKind)win->activeLibraryBookKind);
+    }
     ScheduleUiUpdate(win);
 }
 
+void LibraryOnActiveBookChanged(MainWindow* win, i64 bookId, int kind);
+void OpenLibraryWebBook(MainWindow* win, i64 bookId);
+
 void WebPanelOnDocumentChanged(MainWindow* win) {
-    if (!win || !win->uiState.webPanelVisible) {
+    if (!win) {
+        return;
+    }
+    // PDF tab switch: leave web browser surface and restore this book's AI bindings.
+    WindowTab* tab = win->CurrentTab();
+    if (tab && tab->filePath && LibraryIsAvailable()) {
+        LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
+        if (book) {
+            LibraryOnActiveBookChanged(win, book->id, (int)book->kind);
+            DeleteLibraryBook(book);
+            return;
+        }
+    }
+    win->uiState.webBrowserVisible = false;
+    if (!win->uiState.webPanelVisible) {
         return;
     }
     WriteBridgeJson(win);
-    // Switch to the Tab remembered for this PDF (browser-like). No record → leave as-is.
     RestorePdfActiveTab(win);
 }
 
@@ -2530,8 +3286,8 @@ void WebPanelSpawnScript(Str scriptName, Str extraArgs) {
     logf("WebPanelSpawnScript: ok (hidden) node='%s' script='%s'\n", node, scriptName);
 }
 
-void WebPanelAddPdfToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str title) {
-    if (!pdfPath) {
+void WebPanelAddToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str sourceUrl, Str title) {
+    if (!pdfPath && !sourceUrl) {
         return;
     }
     if (win) {
@@ -2542,8 +3298,6 @@ void WebPanelAddPdfToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str ti
     dir::CreateAll(WebPanelJobsDoneTemp());
     dir::CreateAll(WebPanelJobsFailedTemp());
 
-    // Include prior notebooklm mapping so re-add can jump back to the same notebook
-    // and always rewrite books.notebooklm with the latest placement.
     TempStr priorJson = {};
     if (bookId > 0) {
         Str blob = LibraryStoreGetBookNotebookLm(LibraryGetStore(), bookId);
@@ -2555,15 +3309,20 @@ void WebPanelAddPdfToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str ti
 
     TempStr jobPath = path::JoinTemp(jobs, fmt("add-%lld.json", (i64)UnixTimeMsNow()));
     TempStr body = fmt(
-        "{\n  \"action\": \"notebooklm.add\",\n  \"bookId\": %lld,\n  \"pdfPath\": %s,\n  \"title\": %s,\n"
-        "  \"notebooklm\": %s\n}\n",
-        bookId, EscapeJsonTemp(pdfPath), EscapeJsonTemp(title),
+        "{\n  \"action\": \"notebooklm.add\",\n  \"bookId\": %lld,\n  \"pdfPath\": %s,\n  \"sourceUrl\": %s,\n"
+        "  \"title\": %s,\n  \"notebooklm\": %s\n}\n",
+        bookId, EscapeJsonTemp(pdfPath), EscapeJsonTemp(sourceUrl), EscapeJsonTemp(title),
         priorJson ? EscapeJsonTemp(priorJson) : StrL("\"\""));
     file::WriteFile(jobPath, body);
     TempStr args = fmt("--job \"%s\"", jobPath);
     WebPanelSpawnScript(StrL("notebooklm-add.mjs"), args);
     ScheduleNotebookLmResultPolls();
-    logf("WebPanelAddPdfToNotebookLm: queued '%s'\n", jobPath);
+    logf("WebPanelAddToNotebookLm: queued '%s' pdf='%s' url='%s'\n", jobPath, pdfPath ? pdfPath : StrL(""),
+         sourceUrl ? sourceUrl : StrL(""));
+}
+
+void WebPanelAddPdfToNotebookLm(MainWindow* win, i64 bookId, Str pdfPath, Str title) {
+    WebPanelAddToNotebookLm(win, bookId, pdfPath, {}, title);
 }
 
 void WebPanelSelectNotebookLmSource(MainWindow* win, i64 bookId, Str pdfPath, Str title) {
@@ -2782,4 +3541,985 @@ void UpdateWebPanelTheme(MainWindow* win) {
 
 bool IsWebPanelVisible(MainWindow* win) {
     return win && win->uiState.webPanelVisible;
+}
+
+// --- Center Web browser panel (library web books; isolated tabs, shared env/CDP) ---
+
+namespace {
+
+TempStr WebBrowserTabsPathTemp() {
+    return path::JoinTemp(WebPanelDataDirTemp(), StrL("tabs\\web-index.json"));
+}
+
+TempStr WebBookmarksPathTemp() {
+    return path::JoinTemp(WebPanelDataDirTemp(), StrL("web-bookmarks.txt"));
+}
+
+WNDPROC gWebBrowserBoxWndProc = nullptr;
+
+void ShowActiveWebBrowserTab(MainWindow* win);
+void SaveWebBrowserTabs(MainWindow* win);
+void LoadWebBrowserTabs(MainWindow* win);
+void ActivateWebBrowserTabByIndex(MainWindow* win, int idx, bool remember);
+void RememberBrowserActiveTab(MainWindow* win);
+void SyncWebBrowserTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str title);
+
+int FindWebBrowserTabById(MainWindow* win, Str id) {
+    if (!win || !id) {
+        return -1;
+    }
+    for (int i = 0; i < len(win->webBrowserTabs); i++) {
+        if (str::Eq(win->webBrowserTabs[i].id, id)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int FindWebBrowserTabByWebView(MainWindow* win, WebviewWnd* wv) {
+    if (!win || !wv) {
+        return -1;
+    }
+    for (int i = 0; i < len(win->webBrowserTabs); i++) {
+        if (win->webBrowserTabs[i].wv == wv) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void SaveWebBrowserTabs(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    EnsureWebPanelDataLayout();
+    str::Builder sb;
+    sb.Append(StrL("{\n  \"activeId\": "));
+    Str activeId = {};
+    if (win->webBrowserActiveTab >= 0 && win->webBrowserActiveTab < len(win->webBrowserTabs)) {
+        activeId = win->webBrowserTabs[win->webBrowserActiveTab].id;
+    }
+    sb.Append(EscapeJsonTemp(activeId));
+    sb.Append(StrL(",\n  \"tabs\": [\n"));
+    for (int i = 0; i < len(win->webBrowserTabs); i++) {
+        WebPanelTab& t = win->webBrowserTabs[i];
+        if (i > 0) {
+            sb.Append(StrL(",\n"));
+        }
+        sb.Append(StrL("    {\"id\": "));
+        sb.Append(EscapeJsonTemp(t.id));
+        sb.Append(StrL(", \"url\": "));
+        sb.Append(EscapeJsonTemp(t.url));
+        sb.Append(StrL(", \"title\": "));
+        sb.Append(EscapeJsonTemp(t.title ? t.title : TitleFromUrlTemp(t.url)));
+        if (t.titleLocked) {
+            sb.Append(StrL(", \"titleLocked\": true"));
+        }
+        sb.Append(StrL("}"));
+    }
+    sb.Append(StrL("\n  ]\n}\n"));
+    file::WriteFile(WebBrowserTabsPathTemp(), ToStr(sb));
+}
+
+void LoadWebBrowserTabs(MainWindow* win) {
+    if (!win || len(win->webBrowserTabs) > 0) {
+        return;
+    }
+    Str data = file::ReadFile(WebBrowserTabsPathTemp());
+    if (!data) {
+        return;
+    }
+    struct St {
+        MainWindow* win = nullptr;
+        WebPanelTab cur{};
+        bool inTab = false;
+        Str activeId;
+    } st;
+    st.win = win;
+    auto onVal = [](St* s, json::Value* v) {
+        TempStr p = json::PathFormatTemp(v->path);
+        if (!p) {
+            return;
+        }
+        if (str::EqI(p, StrL("/activeId"))) {
+            str::ReplaceWithCopy(&s->activeId, v->value);
+            return;
+        }
+        if (!str::ContainsI(p, StrL("/tabs"))) {
+            return;
+        }
+        if (str::EndsWithI(p, StrL("/id"))) {
+            if (s->inTab && s->cur.url) {
+                if (!s->cur.id) {
+                    s->cur.id = str::Dup(NewWebPanelTabIdTemp());
+                }
+                if (!s->cur.title) {
+                    s->cur.title = str::Dup(TitleFromUrlTemp(s->cur.url));
+                }
+                s->win->webBrowserTabs.Append(s->cur);
+                s->cur = {};
+            }
+            s->inTab = true;
+            str::ReplaceWithCopy(&s->cur.id, v->value);
+        } else if (str::EndsWithI(p, StrL("/url"))) {
+            s->inTab = true;
+            str::ReplaceWithCopy(&s->cur.url, v->value);
+        } else if (str::EndsWithI(p, StrL("/title"))) {
+            s->inTab = true;
+            str::ReplaceWithCopy(&s->cur.title, v->value);
+        } else if (str::EndsWithI(p, StrL("/titleLocked"))) {
+            s->inTab = true;
+            s->cur.titleLocked = v->value && (str::EqI(v->value, StrL("true")) || str::Eq(v->value, StrL("1")));
+        }
+    };
+    json::Parse(data, MkFunc1<St, json::Value*>(onVal, &st));
+    if (st.inTab && st.cur.url) {
+        if (!st.cur.id) {
+            st.cur.id = str::Dup(NewWebPanelTabIdTemp());
+        }
+        if (!st.cur.title) {
+            st.cur.title = str::Dup(TitleFromUrlTemp(st.cur.url));
+        }
+        win->webBrowserTabs.Append(st.cur);
+    }
+    if (st.activeId) {
+        for (int i = 0; i < len(win->webBrowserTabs); i++) {
+            if (str::Eq(win->webBrowserTabs[i].id, st.activeId)) {
+                win->webBrowserActiveTab = i;
+                break;
+            }
+        }
+    }
+    str::Free(st.activeId);
+    str::Free(data);
+}
+
+void RememberBrowserActiveTab(MainWindow* win) {
+    if (!win || win->webBrowserActiveTab < 0 || win->webBrowserActiveTab >= len(win->webBrowserTabs)) {
+        return;
+    }
+    if (!LibraryIsAvailable() || win->activeLibraryBookId <= 0) {
+        return;
+    }
+    if ((LibraryBookKind)win->activeLibraryBookKind != LibraryBookKind::Web) {
+        return;
+    }
+    WebPanelTab& t = win->webBrowserTabs[win->webBrowserActiveTab];
+    // Center browser binding — do not overwrite AI webTab*.
+    UpsertPdfTabBinding(win->activeLibraryBookId, {}, {}, {}, {}, false, false, false, false, t.id, t.url, true);
+    SaveWebBrowserTabs(win);
+}
+
+void ShowActiveWebBrowserTab(MainWindow* win) {
+    if (!win || !win->webBrowserWebViewSlot) {
+        return;
+    }
+    // Panel hidden → every browser controller must be off or WebView2 will
+    // keep compositing over the PDF canvas (ghost / overlap on fast switch).
+    if (!win->uiState.webBrowserVisible) {
+        for (int i = 0; i < len(win->webBrowserTabs); i++) {
+            WebviewWnd* wv = win->webBrowserTabs[i].wv;
+            if (!wv) {
+                continue;
+            }
+            wv->SetControllerVisible(false, false);
+            wv->SetIsVisible(false);
+            if (wv->hwnd) {
+                ShowWindow(wv->hwnd, SW_HIDE);
+            }
+        }
+        return;
+    }
+    Rect wr = win->webBrowserWebViewSlot->lastBounds;
+    if (wr.dx < 1) {
+        wr.dx = 1;
+    }
+    if (wr.dy < 1) {
+        wr.dy = 1;
+    }
+    for (int i = 0; i < len(win->webBrowserTabs); i++) {
+        WebviewWnd* wv = win->webBrowserTabs[i].wv;
+        if (!wv || !wv->hwnd) {
+            continue;
+        }
+        bool active = (i == win->webBrowserActiveTab);
+        if (active) {
+            MoveWindow(wv->hwnd, wr.x, wr.y, wr.dx, wr.dy, TRUE);
+            wv->EnsureOpaqueBackground();
+            wv->SetIsVisible(true);
+            wv->SetControllerVisible(true, false);
+            wv->UpdateWebviewSize();
+            win->webBrowserWebView = wv;
+        } else {
+            wv->SetControllerVisible(false, false);
+            wv->SetIsVisible(false);
+            ShowWindow(wv->hwnd, SW_HIDE);
+        }
+    }
+}
+
+void LayoutWebBrowserBox(MainWindow* win) {
+    if (!win || !win->hwndWebBrowserBox || !win->webBrowserLayout) {
+        return;
+    }
+    Rect rc = HwndClientRect(win->hwndWebBrowserBox);
+    LayoutTreeToSize(win->hwndWebBrowserBox, win->webBrowserLayout, {rc.dx, rc.dy}, &win->webBrowserRoot);
+    ShowActiveWebBrowserTab(win);
+}
+
+void OnWebBrowserSourceChanged(void* ctx, WebviewWnd* sender, Str url) {
+    auto* win = (MainWindow*)ctx;
+    if (!IsMainWindowValid(win) || !sender) {
+        return;
+    }
+    SyncWebBrowserTabFromWebView(win, sender, url, sender->GetDocumentTitleTemp());
+}
+
+void OnWebBrowserDocumentTitleChanged(void* ctx, WebviewWnd* sender, Str title) {
+    auto* win = (MainWindow*)ctx;
+    if (!IsMainWindowValid(win) || !sender) {
+        return;
+    }
+    SyncWebBrowserTabFromWebView(win, sender, sender->GetSourceTemp(), title);
+}
+
+void OnWebBrowserNavCompleted(void* ctx, Str url, bool success) {
+    auto* win = (MainWindow*)ctx;
+    if (!IsMainWindowValid(win) || !success) {
+        return;
+    }
+    WebviewWnd* wv = win->webBrowserWebView;
+    SyncWebBrowserTabFromWebView(win, wv, url, wv ? wv->GetDocumentTitleTemp() : TempStr{});
+    if (!win->uiState.webBrowserVisible) {
+        // Switched back to PDF before navigate finished — do not resurface WebView2.
+        ShowActiveWebBrowserTab(win);
+        return;
+    }
+    if (win->webBrowserWebView) {
+        // allowSuspend=false: navigate-complete must not fight PDF/Web XOR hide/show.
+        win->webBrowserWebView->SetControllerVisible(true, false);
+        if (win->webBrowserWebView->emulateMobile) {
+            win->webBrowserWebView->ApplyMobileEmulation();
+        }
+    }
+    LayoutWebBrowserBox(win);
+}
+
+static i64 FindBookIdByBrowserTabId(Str tabId) {
+    if (!tabId) {
+        return 0;
+    }
+    Vec<PdfTabBinding> all = LoadAllPdfTabBindings();
+    i64 found = 0;
+    for (PdfTabBinding& b : all) {
+        if ((b.browserTabId && str::Eq(b.browserTabId, tabId)) || (b.webTabId && str::Eq(b.webTabId, tabId))) {
+            found = ParseInt64(b.bookKey);
+            break;
+        }
+    }
+    FreeAllPdfTabBindings(all);
+    return found;
+}
+
+void SyncWebBrowserTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str title) {
+    if (!IsMainWindowValid(win)) {
+        return;
+    }
+    int idx = FindWebBrowserTabByWebView(win, wv);
+    if (idx < 0 || idx >= len(win->webBrowserTabs)) {
+        return;
+    }
+    WebPanelTab& t = win->webBrowserTabs[idx];
+    bool changed = false;
+
+    // Resolve which library web book owns this browser tab (Chrome-like 1:1).
+    i64 bookId = FindBookIdByBrowserTabId(t.id);
+    if (bookId <= 0 && idx == win->webBrowserActiveTab && win->activeLibraryBookId > 0 &&
+        (LibraryBookKind)win->activeLibraryBookKind == LibraryBookKind::Web) {
+        bookId = win->activeLibraryBookId;
+    }
+
+    if (url && !str::StartsWithI(url, StrL("about:"))) {
+        if (!str::Eq(t.url, url)) {
+            str::ReplaceWithCopy(&t.url, url);
+            changed = true;
+        }
+        if (idx == win->webBrowserActiveTab) {
+            str::ReplaceWithCopy(&win->webBrowserCurrentUrl, url);
+        }
+        if (LibraryIsAvailable() && bookId > 0) {
+            LibraryBook* book = LibraryStoreFindBookById(LibraryGetStore(), bookId);
+            if (book && book->kind == LibraryBookKind::Web && (!book->url || !str::Eq(book->url, url))) {
+                LibraryStoreSetBookUrl(LibraryGetStore(), bookId, url);
+            }
+            DeleteLibraryBook(book);
+        }
+    }
+    if (title && title.len > 0) {
+        bool titleIsUrl = str::StartsWithI(title, StrL("http://")) || str::StartsWithI(title, StrL("https://"));
+        // Skip URL-looking titles; real document.title drives the library row.
+        if (!titleIsUrl) {
+            if (!str::Eq(t.title, title)) {
+                str::ReplaceWithCopy(&t.title, title);
+                t.titleLocked = false;
+                changed = true;
+            }
+            // Always push to library even when tab title was already in sync
+            // (web-index may have the title while books.title is still a URL).
+            if (LibraryIsAvailable() && bookId > 0) {
+                LibraryUpdateWebBookTabTitle(bookId, title);
+            }
+        }
+    }
+    if (changed) {
+        SaveWebBrowserTabs(win);
+        if (idx == win->webBrowserActiveTab) {
+            RememberBrowserActiveTab(win);
+        }
+    }
+}
+
+WebviewWnd* CreateWebBrowserTabWebView(MainWindow* win, Str url) {
+    if (!win || !url || !HasWebView() || !win->hwndWebBrowserBox) {
+        return nullptr;
+    }
+    EnsureWebPanelDataLayout();
+    dir::CreateAll(WebViewBrowserProfileDirTemp());
+
+    auto* webView = new WebviewWnd();
+    webView->events.ctx = win;
+    // Dedicated handler — must NOT share OnWebNavStarting (that opens AI tabs).
+    webView->events.navigationStarting = OnWebBrowserNavStarting;
+    webView->events.navigationCompleted = OnWebBrowserNavCompleted;
+    webView->events.sourceChanged = OnWebBrowserSourceChanged;
+    webView->events.documentTitleChanged = OnWebBrowserDocumentTitleChanged;
+    webView->dataDir = str::Dup(WebViewBrowserProfileDirTemp());
+    webView->useDedicatedEnvironment = true;
+    webView->enableDevTools = true;
+    // Opaque white — default transparent background lets the PDF canvas show through.
+    webView->defaultBackgroundColor = kColWhite;
+    // Full desktop browsing (no mobile UA / touch emulation). Mobile mode
+    // breaks slide captchas and overlay close clicks; keep mobile on AI panel only.
+    webView->emulateMobile = false;
+    webView->dedicatedBrowserArgs = str::Dup(fmt("--remote-debugging-port=%d", kLibraryCdpPort));
+    webView->enableBrowserExtensions = true;
+    webView->browserExtensionsDir = str::Dup(BrowserExtensionsInstalledDirTemp());
+    webView->allowClipboardRead = true;
+    webView->desiredVisible = false;
+
+    CreateWebViewArgs wvArgs;
+    wvArgs.parent = win->hwndWebBrowserBox;
+    wvArgs.pos = Rect(0, 0, 1, 1);
+    webView->Create(wvArgs);
+    if (!webView->hwnd) {
+        delete webView;
+        return nullptr;
+    }
+    ShowWindow(webView->hwnd, SW_HIDE);
+    webView->Navigate(url);
+    return webView;
+}
+
+void ActivateWebBrowserTabByIndex(MainWindow* win, int idx, bool remember) {
+    if (!win || idx < 0 || idx >= len(win->webBrowserTabs)) {
+        return;
+    }
+    WebPanelTab& t = win->webBrowserTabs[idx];
+    if (!t.wv && t.url) {
+        t.wv = CreateWebBrowserTabWebView(win, t.url);
+        if (!t.wv) {
+            return;
+        }
+    }
+    win->webBrowserActiveTab = idx;
+    if (t.url) {
+        str::ReplaceWithCopy(&win->webBrowserCurrentUrl, t.url);
+    }
+    win->webBrowserWebView = t.wv;
+    win->webBrowserWebViewReady = t.wv != nullptr;
+    ShowActiveWebBrowserTab(win);
+    SaveWebBrowserTabs(win);
+    LayoutWebBrowserBox(win);
+    if (remember) {
+        RememberBrowserActiveTab(win);
+    }
+}
+
+void CreateNewWebBrowserTab(MainWindow* win, Str url, Str title, Str forcedId = {}) {
+    if (!win || !url) {
+        return;
+    }
+    if (forcedId) {
+        int existing = FindWebBrowserTabById(win, forcedId);
+        if (existing >= 0) {
+            ActivateWebBrowserTabByIndex(win, existing, true);
+            return;
+        }
+    }
+    WebviewWnd* wv = CreateWebBrowserTabWebView(win, url);
+    if (!wv) {
+        return;
+    }
+    WebPanelTab tab;
+    tab.id = str::Dup(forcedId && forcedId.len > 0 ? forcedId : NewWebPanelTabIdTemp());
+    tab.url = str::Dup(url);
+    tab.title = str::Dup(title && title.len > 0 ? title : url);
+    tab.wv = wv;
+    win->webBrowserTabs.Append(tab);
+    ActivateWebBrowserTabByIndex(win, len(win->webBrowserTabs) - 1, true);
+}
+
+bool ActivateOrRecreateWebBrowserTab(MainWindow* win, Str tabId, Str tabUrl, Str titleFallback) {
+    if (!win) {
+        return false;
+    }
+    if (tabId) {
+        int idx = FindWebBrowserTabById(win, tabId);
+        if (idx >= 0) {
+            ActivateWebBrowserTabByIndex(win, idx, true);
+            return true;
+        }
+    }
+    if (tabUrl && tabUrl.len > 0) {
+        CreateNewWebBrowserTab(win, tabUrl, titleFallback && titleFallback.len > 0 ? titleFallback : tabUrl, tabId);
+        return true;
+    }
+    return false;
+}
+
+void CloseWebBrowserTabAt(MainWindow* win, int idx) {
+    if (!win || idx < 0 || idx >= len(win->webBrowserTabs)) {
+        return;
+    }
+    WebPanelTab& t = win->webBrowserTabs[idx];
+    delete t.wv;
+    str::Free(t.id);
+    str::Free(t.url);
+    str::Free(t.title);
+    win->webBrowserTabs.RemoveAt(idx);
+    if (win->webBrowserActiveTab == idx) {
+        win->webBrowserActiveTab = -1;
+        win->webBrowserWebView = nullptr;
+        win->webBrowserWebViewReady = false;
+        if (len(win->webBrowserTabs) > 0) {
+            int next = idx < len(win->webBrowserTabs) ? idx : len(win->webBrowserTabs) - 1;
+            ActivateWebBrowserTabByIndex(win, next, true);
+        } else {
+            // No center Web tabs left — fall back to PDF canvas.
+            win->uiState.webBrowserVisible = false;
+            ApplyCenterContentSurface(win);
+            win->uiState.layout = {};
+            ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
+        }
+    } else if (win->webBrowserActiveTab > idx) {
+        win->webBrowserActiveTab--;
+    }
+    SaveWebBrowserTabs(win);
+    ShowActiveWebBrowserTab(win);
+    LayoutWebBrowserBox(win);
+}
+
+enum {
+    kWebBrowserMenuCloseAll = 9001,
+    kWebBrowserMenuRenameCurrent = 9002,
+};
+
+static Str PromptWebBrowserText(HWND parent, Str title, Str label, Str initial) {
+    // Minimal single-line prompt (same pattern as library rename).
+    struct St {
+        Str title;
+        Str label;
+        Str initial;
+        HWND edit = nullptr;
+        Str result;
+    } state{title, label, initial};
+    enum { kEditId = 1001 };
+#pragma pack(push, 2)
+    struct Tpl {
+        DLGTEMPLATE dlg{};
+        WORD menu = 0;
+        WORD windowClass = 0;
+        WCHAR titleW = 0;
+    } t;
+#pragma pack(pop)
+    t.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+    t.dlg.dwExtendedStyle = WS_EX_DLGMODALFRAME;
+    t.dlg.cx = 280;
+    t.dlg.cy = 92;
+    auto proc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> INT_PTR {
+        auto* s = (St*)GetWindowLongPtrW(hwnd, DWLP_USER);
+        if (msg == WM_INITDIALOG) {
+            s = (St*)lp;
+            SetWindowLongPtrW(hwnd, DWLP_USER, (LONG_PTR)s);
+            SetWindowTextW(hwnd, CWStrTemp(s->title));
+            HFONT font = GetAppFont()->GetHFont();
+            Rect rc = HwndClientRect(hwnd);
+            HWND lab = CreateWindowW(WC_STATICW, CWStrTemp(s->label), WS_CHILD | WS_VISIBLE, 12, 12, rc.dx - 24, 20,
+                                     hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            s->edit = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, CWStrTemp(s->initial ? s->initial : Str{}),
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 12, 35, rc.dx - 24, 24, hwnd,
+                                      (HMENU)kEditId, GetModuleHandleW(nullptr), nullptr);
+            HWND ok = CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("OK")), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                   rc.dx - 174, rc.dy - 38, 76, 26, hwnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
+            HWND cancel = CreateWindowW(WC_BUTTONW, CWStrTemp(_TRA("Cancel")), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                        rc.dx - 88, rc.dy - 38, 76, 26, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr),
+                                        nullptr);
+            for (HWND c : {lab, s->edit, ok, cancel}) {
+                SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+            }
+            HwndSetFocus(s->edit);
+            SendMessageW(s->edit, EM_SETSEL, 0, -1);
+            return FALSE;
+        }
+        if (msg == WM_COMMAND && LOWORD(wp) == IDOK && s) {
+            int n = GetWindowTextLengthW(s->edit);
+            WCHAR* value = AllocArrayTemp<WCHAR>(n + 1);
+            GetWindowTextW(s->edit, value, n + 1);
+            s->result = str::Dup(ToUtf8Temp(value));
+            str::TrimWSInPlace(s->result, str::TrimOpt::Both);
+            if (!s->result) {
+                MessageBeep(MB_ICONWARNING);
+                return TRUE;
+            }
+            EndDialog(hwnd, IDOK);
+            return TRUE;
+        }
+        if ((msg == WM_COMMAND && LOWORD(wp) == IDCANCEL) || msg == WM_CLOSE) {
+            EndDialog(hwnd, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    };
+    INT_PTR result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &t.dlg, parent, proc, (LPARAM)&state);
+    if (result != IDOK) {
+        str::Free(state.result);
+        return {};
+    }
+    return state.result;
+}
+
+void ShowWebBrowserTabsMenu(MainWindow* win) {
+    if (!win || !win->hwndWebBrowserBox) {
+        return;
+    }
+    HMENU menu = CreatePopupMenu();
+    for (int i = 0; i < len(win->webBrowserTabs); i++) {
+        WebPanelTab& t = win->webBrowserTabs[i];
+        TempStr label = t.title ? t.title : (t.url ? t.url : StrL("(blank)"));
+        UINT flags = MF_STRING;
+        if (i == win->webBrowserActiveTab) {
+            flags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, flags, (UINT)(i + 1), CWStrTemp(label));
+    }
+    if (len(win->webBrowserTabs) > 0) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kWebBrowserMenuCloseAll, CWStrTemp(_TRA("关闭全部 Tab")));
+    }
+    POINT pt{};
+    GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    DestroyMenu(menu);
+    if (cmd == kWebBrowserMenuCloseAll) {
+        for (int i = len(win->webBrowserTabs) - 1; i >= 0; i--) {
+            CloseWebBrowserTabAt(win, i);
+        }
+        return;
+    }
+    if (cmd >= 1 && cmd <= len(win->webBrowserTabs)) {
+        ActivateWebBrowserTabByIndex(win, cmd - 1, true);
+    }
+}
+
+void OnWebBrowserBookmarks(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    LoadBookmarks();
+    HMENU menu = CreatePopupMenu();
+    for (int i = 0; i < len(gBookmarks); i++) {
+        TempStr label = gBookmarks[i].title ? gBookmarks[i].title : gBookmarks[i].url;
+        AppendMenuW(menu, MF_STRING, (UINT)(i + 1), CWStrTemp(label));
+    }
+    if (len(gBookmarks) == 0) {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CWStrTemp(_TRA("(无书签)")));
+    }
+    POINT pt{};
+    GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    DestroyMenu(menu);
+    if (cmd >= 1 && cmd <= len(gBookmarks)) {
+        CreateNewWebBrowserTab(win, gBookmarks[cmd - 1].url, gBookmarks[cmd - 1].title);
+    }
+}
+
+void OnWebBrowserTabs(MainWindow* win) {
+    ShowWebBrowserTabsMenu(win);
+}
+
+void OnWebBrowserHistoryButton(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    WebBrowserShowPanel(win);
+    CreateNewWebBrowserTab(win, StrL("edge://history/"), _TRA("历史记录"));
+}
+
+void OnWebBrowserRefresh(MainWindow* win) {
+    if (win && win->webBrowserWebView) {
+        win->webBrowserWebView->Reload();
+    }
+}
+
+void CloseWebBrowserFromLabel(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    win->uiState.webBrowserVisible = false;
+    ScheduleUiUpdate(win);
+}
+
+LRESULT CALLBACK WndProcWebBrowserBox(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    MainWindow* win = FindMainWindowByHwnd(hwnd);
+    if (!win) {
+        return CallWindowProcW(gWebBrowserBoxWndProc, hwnd, msg, wp, lp);
+    }
+    LRESULT res = 0;
+    res = TryReflectMessages(hwnd, msg, wp, lp);
+    if (res) {
+        return res;
+    }
+    if (VirtHostOnMessage(hwnd, win->webBrowserRoot, msg, wp, lp, res, ThemeControlBackgroundColor())) {
+        return res;
+    }
+    if (msg == WM_SIZE) {
+        LayoutWebBrowserBox(win);
+        return 0;
+    }
+    return CallWindowProcW(gWebBrowserBoxWndProc, hwnd, msg, wp, lp);
+}
+
+void EnsureWebBrowserWebView(MainWindow* win) {
+    if (!win || !HasWebView()) {
+        return;
+    }
+    LoadWebBrowserTabs(win);
+    if (win->webBrowserWebViewReady && win->webBrowserWebView) {
+        ShowActiveWebBrowserTab(win);
+        return;
+    }
+    if (win->webBrowserActiveTab >= 0 && win->webBrowserActiveTab < len(win->webBrowserTabs)) {
+        ActivateWebBrowserTabByIndex(win, win->webBrowserActiveTab, false);
+        return;
+    }
+    if (len(win->webBrowserTabs) > 0) {
+        ActivateWebBrowserTabByIndex(win, 0, false);
+    }
+}
+
+void DeferredEnsureWebBrowserWebView(MainWindow* win) {
+    if (!IsMainWindowValid(win) || !win->uiState.webBrowserVisible) {
+        return;
+    }
+    EnsureWebBrowserWebView(win);
+}
+
+} // namespace
+
+static void ClearPdfBrowserTabBinding(i64 bookId) {
+    if (bookId <= 0) {
+        return;
+    }
+    TempStr key = fmt("%lld", bookId);
+    Vec<PdfTabBinding> all = LoadAllPdfTabBindings();
+    PdfTabBinding* b = FindPdfTabBinding(&all, key);
+    if (b) {
+        str::Free(b->browserTabId);
+        str::Free(b->browserTabUrl);
+        b->browserTabId = {};
+        b->browserTabUrl = {};
+        SaveAllPdfTabBindings(all);
+    }
+    FreeAllPdfTabBindings(all);
+}
+
+void WebBrowserCloseTabForLibraryBook(MainWindow* win, i64 bookId) {
+    if (!win || bookId <= 0) {
+        return;
+    }
+    PdfTabBinding bind = LoadPdfTabBindingForBook(bookId);
+    MigrateLegacyWebBrowserBinding(&bind, bookId);
+    bool closed = false;
+    if (bind.browserTabId) {
+        int idx = FindWebBrowserTabById(win, bind.browserTabId);
+        if (idx >= 0) {
+            CloseWebBrowserTabAt(win, idx);
+            closed = true;
+        }
+    }
+    // Always close the visible center tab when this library book is active.
+    if (!closed && win->activeLibraryBookId == bookId && win->webBrowserActiveTab >= 0 &&
+        win->webBrowserActiveTab < len(win->webBrowserTabs)) {
+        CloseWebBrowserTabAt(win, win->webBrowserActiveTab);
+        closed = true;
+    }
+    if (!closed && bind.browserTabUrl) {
+        for (int i = 0; i < len(win->webBrowserTabs); i++) {
+            if (win->webBrowserTabs[i].url && str::EqI(win->webBrowserTabs[i].url, bind.browserTabUrl)) {
+                CloseWebBrowserTabAt(win, i);
+                break;
+            }
+        }
+    }
+    ClearPdfBrowserTabBinding(bookId);
+    FreePdfTabBinding(&bind);
+}
+
+void CreateWebBrowserPanel(MainWindow* win) {
+    if (!HasWebView() || !win) {
+        return;
+    }
+    EnsureWebPanelDataLayout();
+    DWORD style = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    win->hwndWebBrowserBox = CreateWindowExW(0, WC_STATICW, L"", style, 0, 0, 100, 0, win->hwndFrame, nullptr,
+                                             GetModuleHandleW(nullptr), nullptr);
+
+    PlatformFont* labelFont = GetAppSidebarLabelFont();
+    auto header = NewLabelWithClose(win->hwndWebBrowserBox, labelFont, MkFunc0(CloseWebBrowserFromLabel, win));
+    win->webBrowserLabel = header.label;
+    header.label->SetText(_TRA("Web"));
+    win->webBrowserBookmarksBtn =
+        HeaderIconButton(gIconBookmarks, _TRA("书签（点击新建 Tab）"), MkFunc0(OnWebBrowserBookmarks, win));
+    win->webBrowserTabsBtn = HeaderIconButton(gIconTabs, _TRA("Tab 列表"), MkFunc0(OnWebBrowserTabs, win));
+    win->webBrowserHistoryBtn =
+        HeaderIconButton(gIconHistory, _TRA("历史记录"), MkFunc0(OnWebBrowserHistoryButton, win));
+    win->webBrowserExtensionsBtn =
+        HeaderIconButton(gIconExtensions, _TRA("扩展程序"), MkFunc0(OnWebBrowserExtensionsButton, win));
+    win->webBrowserRefreshBtn = HeaderIconButton(kIconRefresh, _TRA("Refresh"), MkFunc0(OnWebBrowserRefresh, win));
+
+    if (len(header.box->children) > 0) {
+        header.box->children[0].flex = 0;
+        header.box->children.Pop();
+    }
+    header.box->AddChild(win->webBrowserBookmarksBtn);
+    header.box->AddChild(win->webBrowserTabsBtn);
+    header.box->AddChild(win->webBrowserHistoryBtn);
+    header.box->AddChild(win->webBrowserExtensionsBtn);
+    header.box->AddChild(new Spacer(0, 0), 1);
+    header.box->AddChild(win->webBrowserRefreshBtn);
+    header.box->AddChild(header.closeBtn);
+    win->webBrowserHeader = header.box;
+
+    auto* sep = new VirtLine();
+    sep->thickness = 1;
+    win->webBrowserWebView = nullptr;
+    win->webBrowserWebViewReady = false;
+    win->webBrowserActiveTab = -1;
+    win->webBrowserWebViewSlot = new Spacer(0, 0);
+
+    auto* vbox = new VBox();
+    vbox->alignCross = CrossAxisAlign::Stretch;
+    vbox->AddChild(win->webBrowserHeader);
+    vbox->AddChild(sep);
+    vbox->AddChild(win->webBrowserWebViewSlot, 1);
+    win->webBrowserLayout = vbox;
+
+    if (!gWebBrowserBoxWndProc) {
+        gWebBrowserBoxWndProc = (WNDPROC)GetWindowLongPtrW(win->hwndWebBrowserBox, GWLP_WNDPROC);
+    }
+    SetWindowLongPtrW(win->hwndWebBrowserBox, GWLP_WNDPROC, (LONG_PTR)WndProcWebBrowserBox);
+    DarkModeApplyToChildControls(win->hwndWebBrowserBox);
+    win->uiState.webBrowserVisible = false;
+    HwndSetVisible(win->hwndWebBrowserBox, false);
+}
+
+void DestroyWebBrowserPanel(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    SaveWebBrowserTabs(win);
+    for (WebPanelTab& tab : win->webBrowserTabs) {
+        delete tab.wv;
+        tab.wv = nullptr;
+        str::Free(tab.id);
+        str::Free(tab.url);
+        str::Free(tab.title);
+    }
+    win->webBrowserTabs.Reset();
+    win->webBrowserActiveTab = -1;
+    win->webBrowserWebView = nullptr;
+    win->webBrowserWebViewReady = false;
+    delete win->webBrowserLayout;
+    win->webBrowserLayout = nullptr;
+    delete win->webBrowserRoot;
+    win->webBrowserRoot = nullptr;
+    win->webBrowserHeader = nullptr;
+    win->webBrowserLabel = nullptr;
+    win->webBrowserBookmarksBtn = nullptr;
+    win->webBrowserTabsBtn = nullptr;
+    win->webBrowserHistoryBtn = nullptr;
+    win->webBrowserExtensionsBtn = nullptr;
+    win->webBrowserRefreshBtn = nullptr;
+    win->webBrowserWebViewSlot = nullptr;
+    if (win->hwndWebBrowserBox) {
+        DestroyWindow(win->hwndWebBrowserBox);
+        win->hwndWebBrowserBox = nullptr;
+    }
+    win->uiState.webBrowserVisible = false;
+}
+
+void RelayoutWebBrowserPanel(MainWindow* win) {
+    if (!win || !win->hwndWebBrowserBox) {
+        return;
+    }
+    LayoutWebBrowserBox(win);
+    if (win->webBrowserWebView && win->webBrowserWebViewReady) {
+        win->webBrowserWebView->UpdateWebviewSize();
+    }
+    RedrawWindow(win->hwndWebBrowserBox, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+bool IsWebBrowserPanelVisible(MainWindow* win) {
+    return win && win->uiState.webBrowserVisible;
+}
+
+void ApplyCenterContentSurface(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    WindowTab* cur = win->CurrentTab();
+    bool favAsTab = cur && cur->IsFavoritesTab();
+    bool wantWeb = !favAsTab && win->uiState.webBrowserVisible && win->hwndWebBrowserBox;
+    logf("ApplyCenterContentSurface t=%llu wantWeb=%d browserVis=%d tabs=%d active=%d canvasHwnd=0x%p browserHwnd=0x%p\n",
+         (u64)GetTickCount64(), wantWeb ? 1 : 0, win->uiState.webBrowserVisible ? 1 : 0, len(win->webBrowserTabs),
+         win->webBrowserActiveTab, win->hwndCanvas, win->hwndWebBrowserBox);
+
+    if (!wantWeb) {
+        // PDF (or favorites): hide WebView2 composition without TrySuspend (fast XOR).
+        for (int i = 0; i < len(win->webBrowserTabs); i++) {
+            WebviewWnd* wv = win->webBrowserTabs[i].wv;
+            if (!wv) {
+                continue;
+            }
+            wv->SetControllerVisible(false, false);
+            wv->SetIsVisible(false);
+            if (wv->hwnd) {
+                ShowWindow(wv->hwnd, SW_HIDE);
+            }
+        }
+        if (win->hwndWebBrowserBox) {
+            HwndSetVisible(win->hwndWebBrowserBox, false);
+        }
+        if (!favAsTab) {
+            HwndSetVisible(win->hwndCanvas, true);
+            SetWindowPos(win->hwndCanvas, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        return;
+    }
+
+    // Web surface: hide PDF canvas first so a transparent WebView cannot show it through.
+    HwndSetVisible(win->hwndCanvas, false);
+    HwndSetVisible(win->hwndWebBrowserBox, true);
+    SetWindowPos(win->hwndWebBrowserBox, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ShowActiveWebBrowserTab(win);
+    if (win->hwndWebBrowserBox) {
+        RelayoutWebBrowserPanel(win);
+    }
+}
+
+void LibraryOnActiveBookChanged(MainWindow* win, i64 bookId, int kindInt) {
+    if (!win || bookId <= 0) {
+        return;
+    }
+    LibraryBookKind kind = kindInt == (int)LibraryBookKind::Web ? LibraryBookKind::Web : LibraryBookKind::Pdf;
+    logf("LibraryOnActiveBookChanged t=%llu bookId=%lld kind=%s prevBrowserVis=%d\n", (u64)GetTickCount64(), bookId,
+         kind == LibraryBookKind::Web ? StrL("web") : StrL("pdf"), win->uiState.webBrowserVisible ? 1 : 0);
+    i64 prevBookId = win->activeLibraryBookId;
+    // Persist prior entry's AI visibility + tab bindings before switching.
+    if (prevBookId > 0 && prevBookId != bookId) {
+        SetBookAiPanelOpen(prevBookId, win->uiState.webPanelVisible);
+    }
+    if (win->uiState.webPanelVisible) {
+        RememberPdfActiveTab(win);
+    }
+    if (win->uiState.webBrowserVisible &&
+        (LibraryBookKind)win->activeLibraryBookKind == LibraryBookKind::Web) {
+        RememberBrowserActiveTab(win);
+    }
+    win->activeLibraryBookId = bookId;
+    win->activeLibraryBookKind = (int)kind;
+    LibrarySaveUiState(win);
+
+    if (kind == LibraryBookKind::Web) {
+        win->uiState.webBrowserVisible = true;
+        EnsureWebBrowserWebView(win);
+        LibraryBook* book = LibraryStoreFindBookById(LibraryGetStore(), bookId);
+        PdfTabBinding bind = LoadPdfTabBindingForBook(bookId);
+        MigrateLegacyWebBrowserBinding(&bind, bookId);
+        TempStr fallbackUrl = book && book->url ? book->url : Str{};
+        TempStr fallbackTitle = book && book->title ? book->title : Str{};
+        if (fallbackTitle && (str::StartsWithI(fallbackTitle, StrL("http://")) ||
+                              str::StartsWithI(fallbackTitle, StrL("https://")))) {
+            fallbackTitle = {}; // library shows full URL as fallback; tab waits for document.title
+        }
+        Str browserId = bind.browserTabId;
+        Str browserUrl = bind.browserTabUrl ? bind.browserTabUrl : fallbackUrl;
+        if (!ActivateOrRecreateWebBrowserTab(win, browserId, browserUrl, fallbackTitle)) {
+            if (fallbackUrl) {
+                CreateNewWebBrowserTab(win, fallbackUrl, fallbackTitle);
+            }
+        }
+        if (win->webBrowserWebView) {
+            SyncWebBrowserTabFromWebView(win, win->webBrowserWebView, win->webBrowserWebView->GetSourceTemp(),
+                                         win->webBrowserWebView->GetDocumentTitleTemp());
+        }
+        LibraryStoreTouchBookOpen(LibraryGetStore(), bookId, UnixTimeMsNow());
+        DeleteLibraryBook(book);
+        FreePdfTabBinding(&bind);
+        ApplyCenterContentSurface(win);
+    } else {
+        win->uiState.webBrowserVisible = false;
+        ApplyCenterContentSurface(win); // hide WebView2 layers immediately
+        if (win->uiState.webPanelVisible) {
+            WriteBridgeJson(win);
+        }
+    }
+    // Restore this book's AI open/closed + companion tabs (auto-load on startup / switch).
+    ApplyBookAiPanelVisibility(win, bookId, kind);
+    SyncLibrarySelection(win);
+    win->uiState.layout = {}; // force RelayoutFrame to apply slot sizes
+    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
+}
+
+void OpenLibraryWebBook(MainWindow* win, i64 bookId) {
+    if (!win || bookId <= 0 || !LibraryIsAvailable()) {
+        return;
+    }
+    LibraryBook* book = LibraryStoreFindBookById(LibraryGetStore(), bookId);
+    if (!book || book->kind != LibraryBookKind::Web) {
+        DeleteLibraryBook(book);
+        return;
+    }
+    DeleteLibraryBook(book);
+    LibraryOnActiveBookChanged(win, bookId, (int)LibraryBookKind::Web);
+}
+
+void WebBrowserShowPanel(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    win->uiState.webBrowserVisible = true;
+    EnsureWebBrowserWebView(win);
+    ApplyCenterContentSurface(win);
+    win->uiState.layout = {};
+    ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
+}
+
+void WebBrowserOpenUrlAsNewTab(MainWindow* win, Str url, Str title) {
+    if (!win || !url) {
+        return;
+    }
+    WebBrowserShowPanel(win);
+    // Always a new tab — duplicates allowed (do not pass forcedId).
+    CreateNewWebBrowserTab(win, url, title && title.len > 0 ? title : url);
 }

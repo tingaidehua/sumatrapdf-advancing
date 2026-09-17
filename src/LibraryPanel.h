@@ -12,5 +12,11 @@ void UpdateLibraryPanelText(MainWindow* win);
 void RefreshLibraryPanel(MainWindow* win);
 void RefreshLibraryPanels();
 void SyncLibrarySelection(MainWindow* win);
+// Persist expand/collapse + last book id (call after selection changes).
+void LibrarySaveUiState(MainWindow* win);
+// Update library row for a web book to match the browser tab title (in-place).
+void LibraryUpdateWebBookTabTitle(i64 bookId, Str title);
+// target=_blank from center Web → new library web book + center browser tab (never AI).
+void LibraryOpenWebUrlInBrowser(MainWindow* win, Str url);
 void SetLibraryPanelVisible(MainWindow* win, bool visible);
 TempStr LibraryDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exitCodeOut);
