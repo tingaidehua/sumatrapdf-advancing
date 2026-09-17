@@ -32,6 +32,9 @@
 #include "Flags.h"
 #include "DisplayModel.h"
 #include "Theme.h"
+#include "AppTools.h"
+#include "WebPanel.h"
+#include "base/UITask.h"
 
 #include "DarkMode_win.h"
 
@@ -104,6 +107,7 @@ struct PdfToolDialog : WindowBase {
     ~PdfToolDialog() override;
 
     bool CreateToolDialog(MainWindow*, WindowTab*, Str title);
+    bool CreateToolDialog(MainWindow*, Str path, Str title);
     HBox* AddRow();
     void AddPathRow();
     void AddDestRow(Str destPath, WStr filter, WStr defExt);
@@ -142,8 +146,18 @@ VirtButton* PdfToolDialog::NewButton(Str text, bool isDefault) {
 }
 
 bool PdfToolDialog::CreateToolDialog(MainWindow* w, WindowTab* tab, Str title) {
+    if (!tab || !tab->filePath) {
+        return false;
+    }
+    return CreateToolDialog(w, tab->filePath, title);
+}
+
+bool PdfToolDialog::CreateToolDialog(MainWindow* w, Str path, Str title) {
+    if (!w || !path) {
+        return false;
+    }
     win = w;
-    srcPath = str::Dup(tab->filePath);
+    srcPath = str::Dup(path);
     PlatformFont* dialogFont = GetDefaultGuiFont();
     closeOnEsc = true;
     onClose = MkFunc1Void(PdfToolDialogOnClose);
@@ -470,10 +484,99 @@ void ShowPdfExtractTextDialog(MainWindow* win) {
 
 // --- Compress PDF dialog ---
 
-struct PdfCompressDialog : PdfToolDialog {
-    bool Create(MainWindow* win, WindowTab* tab);
-    void DoIt(VirtMouseEvent* ev = nullptr) override;
+TempStr CompressedPdfSiblingPathTemp(Str pdfPath) {
+    if (!pdfPath) {
+        return {};
+    }
+    TempStr noExt = path::GetPathNoExtTemp(pdfPath);
+    return str::JoinTemp(noExt, StrL("-压缩.pdf"));
+}
+
+static TempStr MakeCompressedPdfDestTemp(Str pdfPath) {
+    return MakeUniqueFilePathTemp(CompressedPdfSiblingPathTemp(pdfPath));
+}
+
+enum class PdfCompressLevel {
+    Light = 0,
+    Standard = 1,
+    Max = 2,
 };
+
+struct PdfCompressDialog : PdfToolDialog {
+    DropDown* levelDrop = nullptr;
+    Checkbox* chkImages = nullptr;
+    Checkbox* chkFonts = nullptr;
+    VirtText* estimateLabel = nullptr;
+    i64 srcBytes = 0;
+    bool openAfter = true;
+    bool showDoneAlert = true;
+    bool continueNotebookLmAdd = false;
+    i64 notebookLmBookId = 0;
+    Str notebookLmTitle; // owned
+
+    ~PdfCompressDialog() override;
+    bool Create(MainWindow* win, Str path);
+    void DoIt(VirtMouseEvent* ev = nullptr) override;
+    void OnConfigChanged();
+    void UpdateEstimate();
+    PdfCompressLevel SelectedLevel() const;
+};
+
+PdfCompressDialog::~PdfCompressDialog() {
+    str::FreePtr(&notebookLmTitle);
+}
+
+PdfCompressLevel PdfCompressDialog::SelectedLevel() const {
+    int n = levelDrop ? levelDrop->GetCurrentSelection() : 1;
+    if (n <= 0) {
+        return PdfCompressLevel::Light;
+    }
+    if (n >= 2) {
+        return PdfCompressLevel::Max;
+    }
+    return PdfCompressLevel::Standard;
+}
+
+void PdfCompressDialog::UpdateEstimate() {
+    if (!estimateLabel) {
+        return;
+    }
+    // Heuristic: scanned/image-heavy PDFs shrink more; already-compressed ones less.
+    // Factors tuned for typical MuPDF clean flags (not a dry-run).
+    double factor = 0.7;
+    PdfCompressLevel level = SelectedLevel();
+    bool images = !chkImages || chkImages->IsChecked();
+    bool fonts = !chkFonts || chkFonts->IsChecked();
+    switch (level) {
+        case PdfCompressLevel::Light:
+            factor = images ? 0.88 : 0.95;
+            break;
+        case PdfCompressLevel::Standard:
+            factor = images ? 0.55 : 0.82;
+            break;
+        case PdfCompressLevel::Max:
+            factor = images ? 0.40 : 0.72;
+            break;
+    }
+    if (!fonts) {
+        factor = std::min(0.98, factor + 0.05);
+    }
+    i64 predicted = (i64)((double)srcBytes * factor + 0.5);
+    if (srcBytes <= 0) {
+        estimateLabel->SetText(_TRA("无法读取原文件大小"));
+    } else {
+        TempStr origSz = str::DupTemp(FormatFileSizeShortTransTemp(srcBytes));
+        TempStr predSz = FormatFileSizeShortTransTemp(predicted);
+        estimateLabel->SetText(fmt(_TRA("原始: %s    预测压缩后: 约 %s").s, origSz, predSz));
+    }
+    if (hwnd) {
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+}
+
+void PdfCompressDialog::OnConfigChanged() {
+    UpdateEstimate();
+}
 
 void PdfCompressDialog::DoIt(VirtMouseEvent*) {
     TempStr destPath = destEdit->GetTextTemp();
@@ -483,35 +586,169 @@ void PdfCompressDialog::DoIt(VirtMouseEvent*) {
 
     logf("PdfCompressDoIt: compressing '%s' to '%s'\n", srcPath, destPath);
 
-    // equivalent of: clean -gggg -e 100 -f -i -t -Z input output
-    char* argv[] = {(char*)"clean", (char*)"-gggg", (char*)"-e", (char*)"100",      (char*)"-f",
-                    (char*)"-i",    (char*)"-t",    (char*)"-Z", CStrTemp(srcPath), CStrTemp(destPath)};
-    int argc = 10;
+    PdfCompressLevel level = SelectedLevel();
+    bool images = !chkImages || chkImages->IsChecked();
+    bool fonts = !chkFonts || chkFonts->IsChecked();
+
+    // Build argv for pdfclean_main (same family as CmdPdfCompress / sumatrapdf-tool clean).
+    Vec<char*> argv;
+    argv.Append((char*)"clean");
+    if (level == PdfCompressLevel::Light) {
+        argv.Append((char*)"-gg");
+        argv.Append((char*)"-e");
+        argv.Append((char*)"20");
+        argv.Append((char*)"-z");
+        argv.Append((char*)"-t");
+    } else if (level == PdfCompressLevel::Standard) {
+        argv.Append((char*)"-ggg");
+        argv.Append((char*)"-e");
+        argv.Append((char*)"60");
+        argv.Append((char*)"-t");
+        argv.Append((char*)"-Z");
+    } else {
+        // Max — previous default: clean -gggg -e 100 -f -i -t -Z
+        argv.Append((char*)"-gggg");
+        argv.Append((char*)"-e");
+        argv.Append((char*)"100");
+        argv.Append((char*)"-t");
+        argv.Append((char*)"-Z");
+    }
+    if (fonts) {
+        argv.Append((char*)"-f");
+    }
+    if (images) {
+        argv.Append((char*)"-i");
+    }
+    argv.Append(CStrTemp(srcPath));
+    argv.Append(CStrTemp(destPath));
 
     fz_set_optind(0);
-    int res = pdfclean_main(argc, argv);
-    if (res == 0) {
-        logf("PdfCompressDoIt: compressed successfully\n");
-        MainWindow* w = win;
-        TempStr path = str::DupTemp(destPath);
-        Close();
-        LoadArgs args(path, w);
-        StartLoadDocument(&args);
-    } else {
+    int res = pdfclean_main(argv.len, argv.els);
+    if (res != 0) {
         logf("PdfCompressDoIt: pdfclean_main failed with %d\n", res);
         MessageBoxWarning(hwnd, "Failed to compress PDF file.", _TRA("Compress PDF"));
+        return;
+    }
+
+    logf("PdfCompressDoIt: compressed successfully\n");
+    MainWindow* w = win;
+    TempStr path = str::DupTemp(destPath);
+    i64 outBytes = file::GetSize(path);
+    bool doOpen = openAfter;
+    bool doAlert = showDoneAlert;
+    bool doNotebookLm = continueNotebookLmAdd;
+    i64 bookId = notebookLmBookId;
+    Str titleOwned = notebookLmTitle;
+    notebookLmTitle = {};
+
+    Close();
+
+    if (doAlert) {
+        TempStr sizeStr = outBytes >= 0 ? str::DupTemp(FormatFileSizeShortTransTemp(outBytes)) : StrL("?");
+        TempStr msg = fmt(_TRA("压缩完成\n\n文件: %s\n大小: %s").s, path::GetBaseNameTemp(path), sizeStr);
+        MessageBoxW(w ? w->hwndFrame : nullptr, CWStrTemp(msg), CWStrTemp(_TRA("压缩 PDF")),
+                    MB_OK | MB_ICONINFORMATION);
+    }
+    if (doNotebookLm && w && path) {
+        WebPanelAddPdfToNotebookLm(w, bookId, path, titleOwned ? titleOwned : path::GetBaseNameTemp(path));
+        uitask::Post(MkFunc0Void(WebPanelPollBridgeResults), "NotebookLmPoll");
+    }
+    str::Free(titleOwned);
+    if (doOpen && w) {
+        LoadArgs args(path, w);
+        StartLoadDocument(&args);
     }
 }
 
-bool PdfCompressDialog::Create(MainWindow* w, WindowTab* tab) {
-    if (!CreateToolDialog(w, tab, _TRA("Compress PDF"))) {
+bool PdfCompressDialog::Create(MainWindow* w, Str path) {
+    if (!CreateToolDialog(w, path, _TRA("压缩 PDF"))) {
         return false;
     }
+    srcBytes = file::GetSize(srcPath);
     AddPathRow();
-    AddDestRow(MakeUniqueFilePathTemp(srcPath), L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
-    AddButtonsRow(_TRA("Compress PDF"));
+    AddDestRow(MakeCompressedPdfDestTemp(srcPath), L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
+
+    {
+        HBox* row = AddRow();
+        row->gap = font->averageCharWidth;
+        row->AddChild(NewVirtText({.s = _TRA("压缩强度:"), .font = font, .isRtl = IsUIRtl()}));
+
+        auto* dd = new DropDown();
+        DropDown::CreateArgs ddargs;
+        ddargs.parent = hwnd;
+        ddargs.font = font;
+        ddargs.isRtl = IsUIRtl();
+        dd->Create(ddargs);
+        StrVec items;
+        items.Append(_TRA("轻度"));
+        items.Append(_TRA("标准"));
+        items.Append(_TRA("最大"));
+        dd->SetItems(items);
+        dd->SetCurrentSelection(2); // match previous CmdPdfCompress aggressiveness
+        dd->SetColors(ThemeWindowTextColor(), ThemeWindowControlBackgroundColor());
+        dd->onSelectionChanged = MkMethod0<PdfCompressDialog, &PdfCompressDialog::OnConfigChanged>(this);
+        levelDrop = dd;
+        row->AddChild(levelDrop);
+        row->AddChild(new Spacer(0, 0), 1);
+    }
+
+    {
+        HBox* row = AddRow();
+        row->gap = font->averageCharWidth;
+
+        Checkbox::CreateArgs cargs;
+        cargs.parent = hwnd;
+        cargs.font = font;
+        cargs.isRtl = IsUIRtl();
+        cargs.text = _TRA("压缩图像");
+        cargs.initialState = Checkbox::State::Checked;
+        chkImages = new Checkbox();
+        chkImages->Create(cargs);
+        chkImages->onStateChanged = MkMethod0<PdfCompressDialog, &PdfCompressDialog::OnConfigChanged>(this);
+        row->AddChild(chkImages);
+
+        cargs.text = _TRA("压缩字体");
+        chkFonts = new Checkbox();
+        chkFonts->Create(cargs);
+        chkFonts->onStateChanged = MkMethod0<PdfCompressDialog, &PdfCompressDialog::OnConfigChanged>(this);
+        row->AddChild(chkFonts);
+        row->AddChild(new Spacer(0, 0), 1);
+    }
+
+    estimateLabel = NewVirtText({.s = StrL(" "), .font = font, .isRtl = IsUIRtl()});
+    mainBox->AddChild(new Padding(estimateLabel, Insets{rowGap, 0, 0, 0}));
+    UpdateEstimate();
+
+    AddButtonsRow(_TRA("压缩 PDF"));
     FinishDialog(destEdit);
     return true;
+}
+
+void ShowPdfCompressDialogForPath(MainWindow* win, Str pdfPath, bool openAfter, bool continueNotebookLmAdd,
+                                  i64 notebookLmBookId, Str notebookLmTitle) {
+    if (!win || !pdfPath) {
+        return;
+    }
+    if (!file::Exists(pdfPath)) {
+        MessageBoxWarning(win->hwndFrame, _TRA("文件不存在。"), _TRA("压缩 PDF"));
+        return;
+    }
+    if (!str::EndsWithI(pdfPath, StrL(".pdf"))) {
+        MessageBoxWarning(win->hwndFrame, _TRA("仅支持 PDF 文件。"), _TRA("压缩 PDF"));
+        return;
+    }
+    logf("ShowPdfCompressDialogForPath: opening for '%s' notebookLm=%d\n", pdfPath,
+         continueNotebookLmAdd ? 1 : 0);
+
+    auto* dlg = new PdfCompressDialog();
+    dlg->openAfter = openAfter;
+    dlg->showDoneAlert = true;
+    dlg->continueNotebookLmAdd = continueNotebookLmAdd;
+    dlg->notebookLmBookId = notebookLmBookId;
+    dlg->notebookLmTitle = str::Dup(notebookLmTitle);
+    if (!dlg->Create(win, pdfPath)) {
+        delete dlg;
+    }
 }
 
 void ShowPdfCompressDialog(MainWindow* win) {
@@ -525,12 +762,7 @@ void ShowPdfCompressDialog(MainWindow* win) {
     if (!IsPdfDoc(tab)) {
         return;
     }
-    logf("ShowPdfCompressDialog: opening for '%s'\n", tab->filePath);
-
-    auto* dlg = new PdfCompressDialog();
-    if (!dlg->Create(win, tab)) {
-        delete dlg;
-    }
+    ShowPdfCompressDialogForPath(win, tab->filePath, true, false, 0, {});
 }
 
 // --- Decompress PDF dialog ---

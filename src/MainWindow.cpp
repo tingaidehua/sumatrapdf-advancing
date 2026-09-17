@@ -36,6 +36,7 @@
 #include "SumatraPDF.h"
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
+#include "WebPanel.h"
 #include "MainWindow.h"
 #include "SelectionToolbar.h"
 #include "FindBar.h"
@@ -171,6 +172,7 @@ MainWindow::~MainWindow() {
     delete buffer;
     delete tabSelectionHistory;
     ShutdownAIChatForMainWindow(this);
+    DestroyWebPanel(this);
     auto tabs = Tabs();
     DeleteVecMembers(tabs);
     {

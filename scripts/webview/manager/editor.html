@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>Script Editor</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --bg2: #252526;
+    --fg: #d4d4d4;
+    --muted: #858585;
+    --line: #333;
+    --accent: #007acc;
+    --kw: #569cd6;
+    --str: #ce9178;
+    --num: #b5cea8;
+    --cmt: #6a9955;
+    --pun: #d4d4d4;
+    --sel: #264f78;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+    font-size: 13px; overflow: hidden;
+  }
+  #bar {
+    display: flex; align-items: center; gap: 8px; height: 36px;
+    padding: 0 10px; background: var(--bg2); border-bottom: 1px solid var(--line);
+    font-family: "Segoe UI", sans-serif; font-size: 12px;
+  }
+  #bar .path { color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #bar button {
+    background: #0e639c; color: #fff; border: 0; border-radius: 2px;
+    padding: 4px 10px; cursor: pointer; font-size: 12px;
+  }
+  #bar button.secondary { background: #3a3d41; }
+  #bar button:hover { filter: brightness(1.1); }
+  #bar button:disabled { opacity: 0.45; cursor: default; }
+  #wrap {
+    display: grid; grid-template-columns: 52px 1fr; height: calc(100% - 36px);
+  }
+  #gutter {
+    background: var(--bg2); color: var(--muted); text-align: right;
+    padding: 12px 8px 12px 0; overflow: hidden; user-select: none;
+    line-height: 1.55; border-right: 1px solid var(--line);
+  }
+  #editorWrap { position: relative; overflow: auto; }
+  #highlight, #editor {
+    margin: 0; padding: 12px; border: 0; outline: none;
+    white-space: pre; word-wrap: normal; overflow-wrap: normal;
+    line-height: 1.55; tab-size: 2; font: inherit; color: inherit;
+    min-height: 100%; width: 100%;
+  }
+  #highlight {
+    position: absolute; inset: 0; pointer-events: none; z-index: 1;
+    color: var(--fg);
+  }
+  #editor {
+    position: relative; z-index: 2; background: transparent; color: transparent;
+    caret-color: #fff; resize: none; overflow: hidden;
+  }
+  #editor::selection { background: var(--sel); color: transparent; }
+  .kw { color: var(--kw); }
+  .str { color: var(--str); }
+  .num { color: var(--num); }
+  .cmt { color: var(--cmt); }
+  .pun { color: var(--pun); }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span class="path" id="pathLabel">（未选择脚本）</span>
+    <button class="secondary" id="btnFormat" title="格式化 JSON / 简单缩进">格式化</button>
+    <button id="btnSave">保存</button>
+    <button id="btnRun">运行</button>
+  </div>
+  <div id="wrap">
+    <div id="gutter"></div>
+    <div id="editorWrap">
+      <pre id="highlight" aria-hidden="true"></pre>
+      <textarea id="editor" spellcheck="false" wrap="off"></textarea>
+    </div>
+  </div>
+<script>
+(function () {
+  const editor = document.getElementById("editor");
+  const highlight = document.getElementById("highlight");
+  const gutter = document.getElementById("gutter");
+  const pathLabel = document.getElementById("pathLabel");
+  const btnSave = document.getElementById("btnSave");
+  const btnFormat = document.getElementById("btnFormat");
+  const btnRun = document.getElementById("btnRun");
+
+  let lang = "text";
+  let canRun = false;
+  let canEdit = false;
+  let path = "";
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function highlightCode(src, mode) {
+    if (mode === "json") {
+      return escHtml(src).replace(
+        /("(?:\\.|[^"\\])*")\s*:|("(?:\\.|[^"\\])*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(true|false|null)\b/g,
+        function (m, key, str, num, lit) {
+          if (key) return '<span class="str">' + key.slice(0, -1) + '</span><span class="pun">:</span>';
+          if (str) return '<span class="str">' + str + "</span>";
+          if (num) return '<span class="num">' + num + "</span>";
+          if (lit) return '<span class="kw">' + lit + "</span>";
+          return m;
+        }
+      );
+    }
+    // JS / MJS — lightweight tokenizer
+    let out = "";
+    const re =
+      /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b(?:const|let|var|function|async|await|return|import|export|from|class|new|if|else|for|while|try|catch|throw|typeof|instanceof|of|in|default|null|true|false)\b)|(-?\b\d+(?:\.\d+)?\b)|([{}()\[\];,.:=<>!&|?+\-*%/])/g;
+    let last = 0;
+    let m;
+    while ((m = re.exec(src))) {
+      out += escHtml(src.slice(last, m.index));
+      if (m[1]) out += '<span class="cmt">' + escHtml(m[1]) + "</span>";
+      else if (m[2]) out += '<span class="str">' + escHtml(m[2]) + "</span>";
+      else if (m[3]) out += '<span class="kw">' + escHtml(m[3]) + "</span>";
+      else if (m[4]) out += '<span class="num">' + escHtml(m[4]) + "</span>";
+      else if (m[5]) out += '<span class="pun">' + escHtml(m[5]) + "</span>";
+      last = re.lastIndex;
+    }
+    out += escHtml(src.slice(last));
+    return out;
+  }
+
+  function syncView() {
+    const v = editor.value;
+    const lines = v.split("\n").length;
+    let g = "";
+    for (let i = 1; i <= lines; i++) g += i + "\n";
+    gutter.textContent = g;
+    highlight.innerHTML = highlightCode(v, lang) + "\n";
+    // keep sizes in sync
+    editor.style.height = Math.max(editor.scrollHeight, highlight.scrollHeight, 200) + "px";
+    highlight.style.height = editor.style.height;
+  }
+
+  function setContent(text, filePath, fileLang, runnable, editable) {
+    path = filePath || "";
+    lang = fileLang || "text";
+    canRun = !!runnable;
+    // Host passes editable=true only for config.json (scripts stay read-only).
+    canEdit = editable === true;
+    pathLabel.textContent = (path || "（未选择）") + (canEdit ? "" : "  [只读]");
+    btnRun.disabled = !canRun;
+    btnSave.disabled = !canEdit;
+    btnFormat.disabled = !canEdit;
+    editor.readOnly = !canEdit;
+    editor.value = text == null ? "" : String(text);
+    syncView();
+    if (canEdit) editor.focus();
+  }
+
+  function getContent() {
+    return editor.value;
+  }
+
+  function formatDocument() {
+    const v = editor.value;
+    if (lang === "json" || /\.json$/i.test(path)) {
+      try {
+        editor.value = JSON.stringify(JSON.parse(v), null, 2) + "\n";
+        lang = "json";
+        syncView();
+        return true;
+      } catch (e) {
+        alert("JSON 格式化失败: " + e.message);
+        return false;
+      }
+    }
+    // light indent normalize for JS: expand tabs, trim trailing spaces
+    editor.value = v
+      .replace(/\t/g, "  ")
+      .split("\n")
+      .map((l) => l.replace(/[ \t]+$/g, ""))
+      .join("\n");
+    syncView();
+    return true;
+  }
+
+  async function hostCall(method, ...args) {
+    if (window.__sumatra__ && window.__sumatra__.call) {
+      return window.__sumatra__.call(method, ...args);
+    }
+    throw new Error("host bridge unavailable");
+  }
+
+  btnSave.onclick = async function () {
+    if (!canEdit) {
+      alert("仅配置文件可编辑，脚本为只读以防误改。");
+      return;
+    }
+    try {
+      await hostCall("hostSave", getContent());
+    } catch (e) {
+      alert("保存失败: " + e.message);
+    }
+  };
+  btnFormat.onclick = function () {
+    if (!canEdit) return;
+    formatDocument();
+  };
+  btnRun.onclick = async function () {
+    try {
+      if (canEdit) {
+        await hostCall("hostSave", getContent());
+      }
+      await hostCall("hostRun");
+    } catch (e) {
+      alert("运行失败: " + e.message);
+    }
+  };
+
+  editor.addEventListener("input", syncView);
+  editor.addEventListener("scroll", function () {
+    highlight.style.transform = "translate(" + -editor.scrollLeft + "px," + -editor.scrollTop + "px)";
+    gutter.scrollTop = editor.scrollTop;
+  });
+  editor.addEventListener("keydown", function (e) {
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const s = editor.selectionStart;
+      const t = editor.value;
+      editor.value = t.slice(0, s) + "  " + t.slice(editor.selectionEnd);
+      editor.selectionStart = editor.selectionEnd = s + 2;
+      syncView();
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      btnSave.click();
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      formatDocument();
+    }
+  });
+
+  window.setContent = setContent;
+  window.getContent = getContent;
+  window.formatDocument = formatDocument;
+
+  function notifyReady() {
+    if (window.__sumatra__ && window.__sumatra__.notify) {
+      window.__sumatra__.notify("editorReady");
+    }
+  }
+  // bridge may load after first paint
+  notifyReady();
+  setInterval(function () {
+    if (window.__sumatra__ && !window.__editorReadyNotified) {
+      window.__editorReadyNotified = true;
+      notifyReady();
+    }
+  }, 200);
+})();
+</script>
+</body>
+</html>

@@ -33,6 +33,13 @@ extern const char* gIconHome;
 extern const char* gIconLibrary;
 extern const char* gIconBookmarks;
 extern const char* gIconPlus;
+extern const char* gIconChat;
+// Target/aim — focus NotebookLM chat on the current PDF only.
+extern const char* gIconTargetFocus;
+// NotebookLM tab switcher for the current PDF.
+extern const char* gIconNotebookLm;
+// Browser-style tabs list for the AI WebPanel.
+extern const char* gIconTabs;
 
 struct Pixmap;
 

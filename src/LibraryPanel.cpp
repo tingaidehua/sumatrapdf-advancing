@@ -5,6 +5,7 @@
 #include "base/DirScan.h"
 #include "base/File.h"
 #include "base/Win.h"
+#include "base/UITask.h"
 
 #include "gui/Dpi.h"
 #include "gui/UIModels.h"
@@ -31,6 +32,9 @@
 #include "SvgIcons.h"
 #include "Theme.h"
 #include "Translations.h"
+#include "WebPanel.h"
+#include "PdfTools.h"
+#include "ScriptManager.h"
 
 #include "FilterHighlightDraw.h"
 #include "LibraryPanel.h"
@@ -140,6 +144,7 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
                                                         : win->expandedLibraryCollections.Contains(collection->id));
         collectionItems.Append(item);
     }
+    // Phase 1: attach all folders first so siblings always list folders above PDFs.
     for (int i = 0; i < len(collections); i++) {
         LibraryCollection* collection = collections[i];
         LibraryTreeItem* item = collectionItems[i];
@@ -154,7 +159,10 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
         }
         item->parent = parent;
         parent->children.Append(item);
-        AddBooks(item, LibraryBookScope::Collection, collection->id, filter);
+    }
+    // Phase 2: append books under each folder / root (after all child folders).
+    for (int i = 0; i < len(collections); i++) {
+        AddBooks(collectionItems[i], LibraryBookScope::Collection, collections[i]->id, filter);
     }
     DeleteLibraryCollections(collections);
     AddBooks(model->root, LibraryBookScope::ManualRoot, 0, filter);
@@ -258,6 +266,8 @@ void RefreshLibraryPanel(MainWindow* win) {
     win->libraryDropItem = 0;
     win->libraryDragging = false;
     win->libraryDropAfter = false;
+    win->libraryMultiSelected.Reset();
+    win->librarySelectAnchor = 0;
     RememberExpandedCollections(win);
     TempStr filter = FilterTextTemp(win);
     TreeModel* previous = win->libraryTreeView->treeModel;
@@ -346,6 +356,14 @@ static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
         HTREEITEM hSel = TreeView_GetSelection(tv->hwnd);
         HTREEITEM hItem = tv->GetHandleByTreeItem(ev->treeItem);
         isSelected = hSel && hItem && hSel == hItem;
+    }
+    if (!isSelected && win) {
+        for (uintptr_t sel : win->libraryMultiSelected) {
+            if (sel == (uintptr_t)item) {
+                isSelected = true;
+                break;
+            }
+        }
     }
     bool isDrop = win && win->libraryDropItem && win->libraryDropItem == (uintptr_t)item;
     bool dropAsSibling = isDrop && item->kind == LibraryTreeKind::Book && win->libraryDragItem &&
@@ -464,10 +482,20 @@ static void SetLibraryDropItem(MainWindow* win, TreeItem item, bool dropAfter) {
 
 enum {
     kLibraryMenuOpenFolder = 1,
+    kLibraryMenuCopyFilePath,
+    kLibraryMenuCopyDirPath,
     kLibraryMenuRemoveBook,
     kLibraryMenuDeleteCollection,
     kLibraryMenuRenameCollection,
     kLibraryMenuNewCategory,
+    kLibraryMenuAddNotebookLm,
+    kLibraryMenuSelectNotebookLm,
+    kLibraryMenuRenameBook,
+    kLibraryMenuViewDb,
+    kLibraryMenuCompressPdf,
+    kLibraryMenuScriptManager,
+    kLibraryMenuClearTabIds,
+    kLibraryMenuClearTabUrls,
     kLibraryMenuColorNone,
     kLibraryMenuColorFirst,
 };
@@ -520,7 +548,7 @@ static HBITMAP CreateFlatColorSwatch(u32 rgb, int size) {
 
 static void AppendLibraryColorMenu(HMENU parent, Vec<HBITMAP>& bitmaps) {
     HMENU colorMenu = CreatePopupMenu();
-    AppendMenuW(colorMenu, MF_STRING, kLibraryMenuColorNone, CWStrTemp(_TRA("None")));
+    AppendMenuW(colorMenu, MF_STRING, kLibraryMenuColorNone, CWStrTemp(_TRA("无")));
     AppendMenuW(colorMenu, MF_SEPARATOR, 0, nullptr);
     int swatchSize = DpiScale(22);
     for (int i = 0; i < dimof(gLibraryBgSwatches); i++) {
@@ -537,11 +565,110 @@ static void AppendLibraryColorMenu(HMENU parent, Vec<HBITMAP>& bitmaps) {
         mii.hbmpItem = hbmp;
         InsertMenuItemW(colorMenu, GetMenuItemCount(colorMenu), TRUE, &mii);
     }
-    AppendMenuW(parent, MF_POPUP, (UINT_PTR)colorMenu, CWStrTemp(_TRA("Background color")));
+    AppendMenuW(parent, MF_POPUP, (UINT_PTR)colorMenu, CWStrTemp(_TRA("背景颜色")));
 }
 
 static Str PromptLibraryText(HWND parent, Str title, Str label);
 static bool CreateNamedCollection(MainWindow* win, i64 parentId, bool isShelf);
+
+static void UpdateOpenTabsAfterRename(Str oldPath, Str newPath) {
+    if (!oldPath || !newPath) {
+        return;
+    }
+    for (MainWindow* w : gWindows) {
+        if (!w) {
+            continue;
+        }
+        for (int i = 0; i < w->TabCount(); i++) {
+            WindowTab* tab = w->GetTab(i);
+            if (tab && tab->filePath && str::EqI(tab->filePath, oldPath)) {
+                str::ReplaceWithCopy(&tab->filePath, newPath);
+            }
+        }
+    }
+}
+
+static void ShowLibraryBookDbEntry(MainWindow* win, i64 bookId) {
+    LibraryBook* book = LibraryStoreFindBookById(LibraryGetStore(), bookId);
+    if (!book) {
+        MessageBoxW(win ? win->hwndFrame : nullptr, CWStrTemp(_TRA("未找到该图书条目。")), CWStrTemp(_TRA("数据库条目")),
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    str::Builder out;
+    out.Append(StrL("=== books ===\n"));
+    out.Append(fmt("id:              %lld\n", book->id));
+    out.Append(fmt("title:           %s\n", book->title ? book->title : StrL("")));
+    out.Append(fmt("path:            %s\n", book->path ? book->path : StrL("")));
+    out.Append(fmt("open_count:      %lld\n", book->openCount));
+    out.Append(fmt("reading_seconds: %lld\n", book->readingSeconds));
+    out.Append(fmt("last_read_ms:    %lld\n", book->lastReadMs));
+    out.Append(fmt("bg_color:        0x%06X\n", book->bgColor));
+    out.Append(fmt("file_exists:     %s\n", (book->path && file::Exists(book->path)) ? StrL("yes") : StrL("NO")));
+    out.Append(StrL("\n=== notebooklm JSON ===\n"));
+    if (book->notebooklm && book->notebooklm.len > 0) {
+        out.Append(book->notebooklm);
+        out.AppendChar('\n');
+    } else {
+        out.Append(StrL("(empty)\n"));
+    }
+
+    out.Append(StrL("\n=== 归属 ===\n"));
+    {
+        Vec<LibraryBook*> manual =
+            LibraryStoreGetBooks(LibraryGetStore(), LibraryBookScope::ManualRoot, 0, LibrarySort::Manual, Str());
+        bool inManual = false;
+        for (LibraryBook* b : manual) {
+            if (b->id == bookId) {
+                inManual = true;
+                out.Append(fmt("manual_books:    yes (sort_pos=%lld)\n", b->sortPos));
+                break;
+            }
+        }
+        if (!inManual) {
+            out.Append(StrL("manual_books:    no\n"));
+        }
+        DeleteLibraryBooks(manual);
+
+        Vec<LibraryBook*> desk =
+            LibraryStoreGetBooks(LibraryGetStore(), LibraryBookScope::Desk, 0, LibrarySort::Title, Str());
+        bool onDesk = false;
+        for (LibraryBook* b : desk) {
+            if (b->id == bookId) {
+                onDesk = true;
+                break;
+            }
+        }
+        out.Append(fmt("desk_books:      %s\n", onDesk ? StrL("yes") : StrL("no")));
+        DeleteLibraryBooks(desk);
+
+        Vec<LibraryCollection*> cols = LibraryStoreGetCollections(LibraryGetStore());
+        bool anyCol = false;
+        for (LibraryCollection* c : cols) {
+            Vec<LibraryBook*> inCol =
+                LibraryStoreGetBooks(LibraryGetStore(), LibraryBookScope::Collection, c->id, LibrarySort::Manual, Str());
+            for (LibraryBook* b : inCol) {
+                if (b->id == bookId) {
+                    out.Append(fmt("collection:      id=%lld name=%s sort_pos=%lld\n", c->id,
+                                   c->name ? c->name : StrL(""), b->sortPos));
+                    anyCol = true;
+                }
+            }
+            DeleteLibraryBooks(inCol);
+        }
+        if (!anyCol) {
+            out.Append(StrL("collection:      (none)\n"));
+        }
+        DeleteLibraryCollections(cols);
+    }
+
+    out.Append(StrL("\n=== 调试提示 ===\n"));
+    out.Append(StrL("数据库: %OneDrive%\\SumatraPDF\\SumatraPDF-library.db\n"));
+    out.Append(StrL("切换 PDF 白屏时检查 WebPanel/jobs/pending 的 select-*.json 是否堆积\n"));
+
+    ShowTextInWindowDialog(_TRA("图书馆数据库条目"), ToStr(out));
+    DeleteLibraryBook(book);
+}
 
 static void OnTreeContextMenu(ContextMenuEvent* ev) {
     MainWindow* win = FindMainWindowByHwnd(ev->w->hwnd);
@@ -553,22 +680,43 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     HMENU menu = CreatePopupMenu();
     Vec<HBITMAP> swatchBitmaps;
     if (item->kind == LibraryTreeKind::Book) {
-        AppendMenuW(menu, MF_STRING, kLibraryMenuOpenFolder, CWStrTemp(_TRA("Show in folder")));
-        AppendLibraryColorMenu(menu, swatchBitmaps);
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kLibraryMenuRemoveBook, CWStrTemp(_TRA("Remove from Library")));
-    } else if (item->kind == LibraryTreeKind::Collection) {
-        if (item->isShelf) {
-            AppendMenuW(menu, MF_STRING, kLibraryMenuNewCategory, CWStrTemp(_TRA("New Category")));
-            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (item->path) {
+            i64 bytes = file::GetSize(item->path);
+            if (bytes >= 0) {
+                // MB with 2 decimals (avoid depending on float fmt — compute manually).
+                i64 hundredths = (bytes * 100 + 1024 * 1024 / 2) / (1024 * 1024);
+                TempStr sizeLabel =
+                    fmt(_TRA("大小: %lld.%02lld MB").s, hundredths / 100, hundredths % 100);
+                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CWStrTemp(sizeLabel));
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            }
         }
+        AppendMenuW(menu, MF_STRING, kLibraryMenuOpenFolder, CWStrTemp(_TRA("在文件夹中显示")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuCopyFilePath, CWStrTemp(_TRA("复制文件路径")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuCopyDirPath, CWStrTemp(_TRA("复制文件所在目录路径")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuCompressPdf, CWStrTemp(_TRA("压缩 PDF")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuScriptManager, CWStrTemp(_TRA("脚本管理")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuAddNotebookLm, CWStrTemp(_TRA("添加到 NotebookLM")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuSelectNotebookLm, CWStrTemp(_TRA("在 NotebookLM 中仅选中此来源")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuRenameBook, CWStrTemp(_TRA("重命名")));
         AppendLibraryColorMenu(menu, swatchBitmaps);
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kLibraryMenuRenameCollection,
-                    CWStrTemp(item->isShelf ? _TRA("Rename Shelf") : _TRA("Rename Category")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuClearTabIds, CWStrTemp(_TRA("删除 Tab 页 ID 记录")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuClearTabUrls, CWStrTemp(_TRA("删除 Tab 页 URL 记录")));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kLibraryMenuDeleteCollection,
-                    CWStrTemp(item->isShelf ? _TRA("Delete Shelf") : _TRA("Delete Category")));
+        AppendMenuW(menu, MF_STRING, kLibraryMenuViewDb, CWStrTemp(_TRA("查看数据库条目")));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kLibraryMenuRemoveBook, CWStrTemp(_TRA("从图书馆移除")));
+    } else if (item->kind == LibraryTreeKind::Collection) {
+        AppendMenuW(menu, MF_STRING, kLibraryMenuScriptManager, CWStrTemp(_TRA("脚本管理")));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kLibraryMenuNewCategory, CWStrTemp(_TRA("新建子文件夹")));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendLibraryColorMenu(menu, swatchBitmaps);
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kLibraryMenuRenameCollection, CWStrTemp(_TRA("重命名文件夹")));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kLibraryMenuDeleteCollection, CWStrTemp(_TRA("删除文件夹")));
     }
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, ev->mouseScreen.x, ev->mouseScreen.y, 0,
                              win->hwndFrame, nullptr);
@@ -580,6 +728,81 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     if (cmd == kLibraryMenuOpenFolder) {
         if (item->path) {
             SumatraOpenPathInDefaultFileManager(item->path);
+        }
+    } else if (cmd == kLibraryMenuCopyFilePath) {
+        if (item->path) {
+            CopyTextToClipboard(item->path);
+        }
+    } else if (cmd == kLibraryMenuCopyDirPath) {
+        if (item->path) {
+            TempStr dir = path::GetDirTemp(item->path);
+            if (dir) {
+                CopyTextToClipboard(dir);
+            }
+        }
+    } else if (cmd == kLibraryMenuCompressPdf) {
+        if (item->path) {
+            ShowPdfCompressDialogForPath(win, item->path, false);
+        }
+    } else if (cmd == kLibraryMenuScriptManager) {
+        ShowScriptManagerDialog(win);
+    } else if (cmd == kLibraryMenuAddNotebookLm) {
+        if (item->path) {
+            TempStr title = item->text ? item->text : item->path;
+            TempStr uploadPath = item->path;
+            i64 bytes = file::GetSize(item->path);
+            if (bytes > kNotebookLmMaxUploadBytes) {
+                TempStr compressed = CompressedPdfSiblingPathTemp(item->path);
+                if (file::Exists(compressed)) {
+                    uploadPath = compressed;
+                    logf("LibraryAddNotebookLm: using compressed sibling '%s'\n", uploadPath);
+                } else {
+                    // Over NotebookLM 200 MB limit and no sibling yet — configure compress first.
+                    MessageBoxW(win->hwndFrame,
+                                CWStrTemp(_TRA("该 PDF 超过 NotebookLM 200 MB 上传限制。\n请先压缩，完成后将自动添加。")),
+                                CWStrTemp(_TRA("压缩 PDF")), MB_OK | MB_ICONINFORMATION);
+                    ShowPdfCompressDialogForPath(win, item->path, false, true, item->bookId, title);
+                    return;
+                }
+            }
+            WebPanelAddPdfToNotebookLm(win, item->bookId, uploadPath, title);
+            uitask::Post(MkFunc0Void(WebPanelPollBridgeResults), "NotebookLmPoll");
+        }
+    } else if (cmd == kLibraryMenuSelectNotebookLm) {
+        if (item->path) {
+            WebPanelSelectNotebookLmSource(win, item->bookId, item->path, item->text ? item->text : item->path);
+        }
+    } else if (cmd == kLibraryMenuRenameBook) {
+        if (item->path && item->bookId > 0) {
+            Str name = PromptLibraryText(win->hwndFrame, _TRA("重命名"), _TRA("新文件名（含扩展名）"));
+            if (name) {
+                TempStr base = name;
+                if (!str::EndsWithI(base, StrL(".pdf"))) {
+                    base = str::JoinTemp(base, StrL(".pdf"));
+                }
+                Str newPath = {};
+                Str oldPath = str::Dup(item->path);
+                if (LibraryStoreRenameBookFile(LibraryGetStore(), item->bookId, base, &newPath)) {
+                    UpdateOpenTabsAfterRename(oldPath, newPath);
+                    changed = true;
+                } else {
+                    MessageBoxW(win->hwndFrame, CWStrTemp(fmt("%s\n%s", _TRA("重命名失败。"), LibraryGetError())),
+                                CWStrTemp(_TRA("重命名")), MB_OK | MB_ICONERROR);
+                }
+                str::Free(oldPath);
+                str::Free(newPath);
+                str::Free(name);
+            }
+        }
+    } else if (cmd == kLibraryMenuViewDb) {
+        ShowLibraryBookDbEntry(win, item->bookId);
+    } else if (cmd == kLibraryMenuClearTabIds) {
+        if (item->bookId > 0) {
+            WebPanelClearPdfTabIds(item->bookId);
+        }
+    } else if (cmd == kLibraryMenuClearTabUrls) {
+        if (item->bookId > 0) {
+            WebPanelClearPdfTabUrls(item->bookId);
         }
     } else if (cmd == kLibraryMenuColorNone) {
         if (item->kind == LibraryTreeKind::Book) {
@@ -599,8 +822,7 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     } else if (cmd == kLibraryMenuDeleteCollection) {
         changed = LibraryStoreDeleteCollection(LibraryGetStore(), item->collectionId);
     } else if (cmd == kLibraryMenuRenameCollection) {
-        Str name = PromptLibraryText(win->hwndFrame, item->isShelf ? _TRA("Rename Shelf") : _TRA("Rename Category"),
-                                     _TRA("New name"));
+        Str name = PromptLibraryText(win->hwndFrame, _TRA("重命名文件夹"), _TRA("新名称"));
         if (name) {
             changed = LibraryStoreRenameCollection(LibraryGetStore(), item->collectionId, name);
             str::Free(name);
@@ -611,17 +833,295 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     if (changed) RefreshLibraryPanels();
 }
 
+static HCURSOR gLibraryCursorMove = nullptr;
+static HCURSOR gLibraryCursorCopy = nullptr;
+
+// Build a 32x32 drag cursor: arrow tip + document rectangle; withPlus adds a
+// small [+] badge at the rectangle's bottom-right (Ctrl = add tag / copy).
+static HCURSOR CreateLibraryDragCursor(bool withPlus) {
+    const int sz = 32;
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = sz;
+    bi.bV5Height = -sz;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC hdc = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(hdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, hdc);
+    if (!color || !bits) {
+        if (color) DeleteObject(color);
+        return nullptr;
+    }
+    auto* px = (u32*)bits;
+    memset(px, 0, sz * sz * 4);
+    auto put = [&](int x, int y, u32 argb) {
+        if (x >= 0 && x < sz && y >= 0 && y < sz) {
+            px[y * sz + x] = argb;
+        }
+    };
+    // Simple black arrow (hotspot 0,0).
+    for (int i = 0; i < 12; i++) {
+        put(0, i, 0xFF000000);
+        put(1, i, 0xFFFFFFFF);
+    }
+    for (int i = 0; i < 8; i++) {
+        put(i, i, 0xFF000000);
+        if (i + 1 < sz) put(i + 1, i, 0xFFFFFFFF);
+    }
+    put(0, 12, 0xFF000000);
+    put(1, 11, 0xFF000000);
+    put(2, 10, 0xFF000000);
+    // Document rectangle under the arrow tip.
+    const int rx = 8, ry = 10, rw = 14, rh = 16;
+    for (int y = ry; y < ry + rh; y++) {
+        for (int x = rx; x < rx + rw; x++) {
+            bool edge = x == rx || x == rx + rw - 1 || y == ry || y == ry + rh - 1;
+            put(x, y, edge ? 0xFF000000 : 0xFFFFFFFF);
+        }
+    }
+    if (withPlus) {
+        const int bx = rx + rw - 1, by = ry + rh - 1, bs = 9;
+        for (int y = by; y < by + bs; y++) {
+            for (int x = bx; x < bx + bs; x++) {
+                bool edge = x == bx || x == bx + bs - 1 || y == by || y == by + bs - 1;
+                put(x, y, edge ? 0xFF000000 : 0xFFFFFFFF);
+            }
+        }
+        int cx = bx + bs / 2, cy = by + bs / 2;
+        for (int d = -2; d <= 2; d++) {
+            put(cx + d, cy, 0xFF000000);
+            put(cx, cy + d, 0xFF000000);
+        }
+    }
+    HBITMAP mask = CreateBitmap(sz, sz, 1, 1, nullptr);
+    ICONINFO ii{};
+    ii.fIcon = FALSE;
+    ii.xHotspot = 0;
+    ii.yHotspot = 0;
+    ii.hbmMask = mask;
+    ii.hbmColor = color;
+    HCURSOR cur = CreateIconIndirect(&ii);
+    DeleteObject(mask);
+    DeleteObject(color);
+    return cur;
+}
+
+static void EnsureLibraryDragCursors() {
+    if (!gLibraryCursorMove) {
+        gLibraryCursorMove = CreateLibraryDragCursor(false);
+    }
+    if (!gLibraryCursorCopy) {
+        gLibraryCursorCopy = CreateLibraryDragCursor(true);
+    }
+}
+
+static bool IsCtrlDown() {
+    return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+}
+
+static void ClearLibraryMultiSelection(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    win->libraryMultiSelected.Reset();
+    win->librarySelectAnchor = 0;
+}
+
+static bool IsLibraryMultiSelected(MainWindow* win, LibraryTreeItem* item) {
+    if (!win || !item) {
+        return false;
+    }
+    uintptr_t key = (uintptr_t)item;
+    for (uintptr_t sel : win->libraryMultiSelected) {
+        if (sel == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void AddLibraryMultiSelected(MainWindow* win, LibraryTreeItem* item) {
+    if (!win || !item || item->kind != LibraryTreeKind::Book) {
+        return;
+    }
+    if (IsLibraryMultiSelected(win, item)) {
+        return;
+    }
+    win->libraryMultiSelected.Append((uintptr_t)item);
+}
+
+static void RemoveLibraryMultiSelected(MainWindow* win, LibraryTreeItem* item) {
+    if (!win || !item) {
+        return;
+    }
+    uintptr_t key = (uintptr_t)item;
+    for (int i = 0; i < len(win->libraryMultiSelected); i++) {
+        if (win->libraryMultiSelected[i] == key) {
+            win->libraryMultiSelected.RemoveAt(i);
+            return;
+        }
+    }
+}
+
+static void SetLibraryMultiSelectionOne(MainWindow* win, LibraryTreeItem* item) {
+    ClearLibraryMultiSelection(win);
+    if (item && item->kind == LibraryTreeKind::Book) {
+        win->libraryMultiSelected.Append((uintptr_t)item);
+        win->librarySelectAnchor = (uintptr_t)item;
+    }
+}
+
+static void CollectVisibleLibraryBooks(TreeView* tv, HTREEITEM hi, Vec<LibraryTreeItem*>* out) {
+    if (!tv || !tv->hwnd || !out) {
+        return;
+    }
+    for (; hi; hi = TreeView_GetNextSibling(tv->hwnd, hi)) {
+        auto* item = (LibraryTreeItem*)tv->GetTreeItemByHandle(hi);
+        if (item && item->kind == LibraryTreeKind::Book) {
+            out->Append(item);
+        }
+        UINT state = TreeView_GetItemState(tv->hwnd, hi, TVIS_EXPANDED);
+        if (state & TVIS_EXPANDED) {
+            HTREEITEM child = TreeView_GetChild(tv->hwnd, hi);
+            if (child) {
+                CollectVisibleLibraryBooks(tv, child, out);
+            }
+        }
+    }
+}
+
+static void SelectLibraryBookRange(MainWindow* win, LibraryTreeItem* from, LibraryTreeItem* to) {
+    if (!win || !win->libraryTreeView || !from || !to) {
+        return;
+    }
+    if (from->kind != LibraryTreeKind::Book || to->kind != LibraryTreeKind::Book) {
+        SetLibraryMultiSelectionOne(win, to);
+        return;
+    }
+    Vec<LibraryTreeItem*> visible;
+    HTREEITEM root = TreeView_GetRoot(win->libraryTreeView->hwnd);
+    CollectVisibleLibraryBooks(win->libraryTreeView, root, &visible);
+    int i0 = -1, i1 = -1;
+    for (int i = 0; i < len(visible); i++) {
+        if (visible[i] == from) {
+            i0 = i;
+        }
+        if (visible[i] == to) {
+            i1 = i;
+        }
+    }
+    if (i0 < 0 || i1 < 0) {
+        SetLibraryMultiSelectionOne(win, to);
+        return;
+    }
+    if (i0 > i1) {
+        std::swap(i0, i1);
+    }
+    win->libraryMultiSelected.Reset();
+    for (int i = i0; i <= i1; i++) {
+        win->libraryMultiSelected.Append((uintptr_t)visible[i]);
+    }
+}
+
+static void GetLibraryDragBooks(MainWindow* win, LibraryTreeItem* clicked, Vec<LibraryTreeItem*>* out) {
+    if (!win || !out) {
+        return;
+    }
+    out->Reset();
+    if (len(win->libraryMultiSelected) > 0) {
+        for (uintptr_t sel : win->libraryMultiSelected) {
+            auto* item = (LibraryTreeItem*)sel;
+            if (item && item->kind == LibraryTreeKind::Book) {
+                out->Append(item);
+            }
+        }
+        if (len(*out) > 0) {
+            return;
+        }
+    }
+    if (clicked && clicked->kind == LibraryTreeKind::Book) {
+        out->Append(clicked);
+    }
+}
+
+static void UpdateLibraryDragCursor() {
+    EnsureLibraryDragCursors();
+    bool copy = IsCtrlDown();
+    HCURSOR cur = copy ? gLibraryCursorCopy : gLibraryCursorMove;
+    if (!cur) {
+        cur = LoadCursorW(nullptr, IDC_ARROW);
+    }
+    SetCursor(cur);
+}
+
 static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     MainWindow* win = (MainWindow*)data;
     if (msg == WM_LBUTTONDOWN && win && win->libraryTreeView) {
         TVHITTESTINFO ht{};
         ht.pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         TreeView_HitTest(hwnd, &ht);
-        // +/- is expand, not a drag handle.
-        win->libraryDragItem = (ht.flags & TVHT_ONITEMBUTTON) ? 0 : win->libraryTreeView->GetTreeItemByHandle(ht.hItem);
+        if (ht.flags & TVHT_ONITEMBUTTON) {
+            // Expand/collapse — leave to default TreeView handling.
+            win->libraryDragItem = 0;
+            win->libraryDragging = false;
+            SetLibraryDropItem(win, 0, false);
+            return DefSubclassProc(hwnd, msg, wp, lp);
+        }
+        auto* item = (LibraryTreeItem*)win->libraryTreeView->GetTreeItemByHandle(ht.hItem);
         win->libraryDragStart = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         win->libraryDragging = false;
         SetLibraryDropItem(win, 0, false);
+
+        bool ctrl = (wp & MK_CONTROL) != 0;
+        bool shift = (wp & MK_SHIFT) != 0;
+        if (item && item->kind == LibraryTreeKind::Book) {
+            if (shift && win->librarySelectAnchor) {
+                auto* anchor = (LibraryTreeItem*)win->librarySelectAnchor;
+                SelectLibraryBookRange(win, anchor, item);
+            } else if (ctrl) {
+                if (IsLibraryMultiSelected(win, item)) {
+                    RemoveLibraryMultiSelected(win, item);
+                } else {
+                    AddLibraryMultiSelected(win, item);
+                }
+                win->librarySelectAnchor = (uintptr_t)item;
+            } else {
+                // Plain click: keep multi-select if clicking an already-selected book (for drag).
+                if (!IsLibraryMultiSelected(win, item) || len(win->libraryMultiSelected) <= 1) {
+                    SetLibraryMultiSelectionOne(win, item);
+                }
+                win->librarySelectAnchor = (uintptr_t)item;
+            }
+            win->libraryDragItem = (uintptr_t)item;
+            win->libraryTreeView->SelectItem((TreeItem)item);
+            HwndInvalidate(hwnd);
+            SetFocus(hwnd);
+            return 0;
+        }
+        // Folder / empty: single selection, clear multi.
+        ClearLibraryMultiSelection(win);
+        win->libraryDragItem = item ? (uintptr_t)item : 0;
+        if (item) {
+            win->libraryTreeView->SelectItem((TreeItem)item);
+        }
+        HwndInvalidate(hwnd);
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
+    if (msg == WM_SETCURSOR && win && win->libraryDragging) {
+        UpdateLibraryDragCursor();
+        return TRUE;
+    }
+    if (msg == WM_KEYDOWN || msg == WM_KEYUP) {
+        if (win && win->libraryDragging && (wp == VK_CONTROL)) {
+            UpdateLibraryDragCursor();
+        }
     }
     if (msg == WM_MOUSEMOVE && win && win->libraryDragItem && (wp & MK_LBUTTON)) {
         int dx = std::abs(GET_X_LPARAM(lp) - win->libraryDragStart.x);
@@ -629,9 +1129,10 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         if (!win->libraryDragging && (dx >= 3 || dy >= 3)) {
             win->libraryDragging = true;
             SetCapture(hwnd);
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            UpdateLibraryDragCursor();
         }
         if (win->libraryDragging) {
+            UpdateLibraryDragCursor();
             RECT clientRc{};
             GetClientRect(hwnd, &clientRc);
             int y = GET_Y_LPARAM(lp);
@@ -675,30 +1176,51 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         }
         bool wasDragging = win->libraryDragging;
         bool filtered = win->libraryModelFiltered;
+        bool copy = IsCtrlDown(); // Ctrl = add tag (keep source membership)
         bool changed = false;
         if (wasDragging && source && source != target && !filtered) {
-            if (source->kind == LibraryTreeKind::Book && target && target->kind == LibraryTreeKind::Book) {
-                i64 srcCol = CollectionIdForItem(source);
-                i64 dstCol = CollectionIdForItem(target);
-                if (srcCol == dstCol) {
-                    changed = LibraryStoreReorderBook(LibraryGetStore(), source->bookId, srcCol, target->bookId,
-                                                     dropAfter);
-                } else {
-                    changed = LibraryStorePlaceBook(LibraryGetStore(), source->bookId, srcCol, dstCol, false);
-                    if (changed) {
-                        changed = LibraryStoreReorderBook(LibraryGetStore(), source->bookId, dstCol, target->bookId,
-                                                          dropAfter) ||
+            Vec<LibraryTreeItem*> books;
+            GetLibraryDragBooks(win, source, &books);
+            if (len(books) > 0 &&
+                (source->kind == LibraryTreeKind::Book || len(win->libraryMultiSelected) > 0)) {
+                // Drop one or more books onto a folder or beside another book.
+                for (LibraryTreeItem* book : books) {
+                    if (!book || book == target) {
+                        continue;
+                    }
+                    if (target && target->kind == LibraryTreeKind::Book) {
+                        i64 srcCol = CollectionIdForItem(book);
+                        i64 dstCol = CollectionIdForItem(target);
+                        if (srcCol == dstCol) {
+                            changed = LibraryStoreReorderBook(LibraryGetStore(), book->bookId, srcCol, target->bookId,
+                                                             dropAfter) ||
+                                      changed;
+                        } else {
+                            bool ok = LibraryStorePlaceBook(LibraryGetStore(), book->bookId, srcCol, dstCol, copy);
+                            if (ok) {
+                                changed = true;
+                                LibraryStoreReorderBook(LibraryGetStore(), book->bookId, dstCol, target->bookId,
+                                                        dropAfter);
+                            }
+                        }
+                    } else {
+                        changed = LibraryStorePlaceBook(LibraryGetStore(), book->bookId, CollectionIdForItem(book),
+                                                        CollectionIdForItem(target), copy) ||
                                   changed;
                     }
                 }
-            } else if (source->kind == LibraryTreeKind::Book) {
-                changed = LibraryStorePlaceBook(LibraryGetStore(), source->bookId, CollectionIdForItem(source),
-                                                CollectionIdForItem(target), false);
-            } else if (source->kind == LibraryTreeKind::Collection && source->isShelf && !target) {
-                changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, 0);
-            } else if (source->kind == LibraryTreeKind::Collection && !source->isShelf && target &&
-                       target->kind == LibraryTreeKind::Collection && target->isShelf) {
-                changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, target->collectionId);
+            } else if (source->kind == LibraryTreeKind::Collection) {
+                i64 newParent = 0;
+                if (target && target->kind == LibraryTreeKind::Collection) {
+                    newParent = target->collectionId;
+                } else if (target && target->kind == LibraryTreeKind::Book) {
+                    newParent = CollectionIdForItem(target);
+                }
+                if (!target || target->kind == LibraryTreeKind::Collection || target->kind == LibraryTreeKind::Book) {
+                    if (newParent != source->collectionId) {
+                        changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, newParent);
+                    }
+                }
             }
         }
         if (win->libraryDragging) {
@@ -711,7 +1233,8 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
             RefreshLibraryPanels();
             return 0;
         }
-        if (!wasDragging && source && source->kind == LibraryTreeKind::Book) {
+        // Open only on a simple single-book click (not a multi-select gesture).
+        if (!wasDragging && source && source->kind == LibraryTreeKind::Book && len(win->libraryMultiSelected) <= 1) {
             OpenLibraryItem(win, source);
             return 0;
         }
@@ -731,6 +1254,7 @@ static void CloseLibrary(MainWindow* win, VirtMouseEvent*) {
 
 enum {
     kLibraryAddShelf = 1,
+    kLibraryAddFolder,
     kLibraryAddPdf,
     kLibraryImportDir,
     kLibraryReplacePath,
@@ -819,22 +1343,21 @@ static Str PromptLibraryText(HWND parent, Str title, Str label) {
 }
 
 static bool CreateNamedCollection(MainWindow* win, i64 parentId, bool isShelf) {
-    Str title = isShelf ? _TRA("New Shelf") : _TRA("New Category");
-    Str label = isShelf ? _TRA("Shelf name") : _TRA("Category name");
+    Str title = isShelf ? _TRA("新建书架") : _TRA("新建文件夹");
+    Str label = isShelf ? _TRA("书架名称") : _TRA("文件夹名称（标签）");
     Str name = PromptLibraryText(win->hwndFrame, title, label);
     if (!name) {
         return false;
     }
     LibraryCollection* created = LibraryStoreCreateCollection(LibraryGetStore(), parentId, isShelf, name);
     if (!created) {
-        logf("Library failed to create %s '%s': %s\n", isShelf ? StrL("shelf") : StrL("category"), name,
+        logf("Library failed to create %s '%s': %s\n", isShelf ? StrL("shelf") : StrL("folder"), name,
              LibraryGetError());
-        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("Could not create the shelf or category.")), CWStrTemp(title),
-                    MB_OK | MB_ICONWARNING);
+        MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("无法创建文件夹。")), CWStrTemp(title), MB_OK | MB_ICONWARNING);
         str::Free(name);
         return false;
     }
-    logf("Library created %s '%s' id=%lld\n", isShelf ? StrL("shelf") : StrL("category"), name, created->id);
+    logf("Library created %s '%s' id=%lld\n", isShelf ? StrL("shelf") : StrL("folder"), name, created->id);
     DeleteLibraryCollection(created);
     str::Free(name);
     return true;
@@ -979,17 +1502,20 @@ static void ImportPdfDirectory(MainWindow* win) {
 
 static void AddMenu(MainWindow* win, VirtMouseEvent* ev) {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kLibraryAddShelf, CWStrTemp(_TRA("New Shelf")));
+    AppendMenuW(menu, MF_STRING, kLibraryAddFolder, CWStrTemp(_TRA("新建文件夹")));
+    AppendMenuW(menu, MF_STRING, kLibraryAddShelf, CWStrTemp(_TRA("新建书架")));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kLibraryAddPdf, CWStrTemp(_TRA("Add PDF...")));
-    AppendMenuW(menu, MF_STRING, kLibraryImportDir, CWStrTemp(_TRA("Import PDF Directory...")));
+    AppendMenuW(menu, MF_STRING, kLibraryAddPdf, CWStrTemp(_TRA("添加 PDF...")));
+    AppendMenuW(menu, MF_STRING, kLibraryImportDir, CWStrTemp(_TRA("导入 PDF 目录...")));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kLibraryReplacePath, CWStrTemp(_TRA("Replace Path Prefix...")));
+    AppendMenuW(menu, MF_STRING, kLibraryReplacePath, CWStrTemp(_TRA("替换路径前缀...")));
     Point pt = HwndClientToScreen(win->hwndLibraryBox, ev->pt);
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
     DestroyMenu(menu);
     if (cmd == kLibraryAddShelf) {
         if (CreateNamedCollection(win, 0, true)) RefreshLibraryPanels();
+    } else if (cmd == kLibraryAddFolder) {
+        if (CreateNamedCollection(win, 0, false)) RefreshLibraryPanels();
     } else if (cmd == kLibraryAddPdf) {
         AddPdfFiles(win);
     } else if (cmd == kLibraryImportDir) {

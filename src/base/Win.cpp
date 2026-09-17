@@ -1435,6 +1435,39 @@ HANDLE LaunchProcessInDir(Str cmdLine, Str currDir, DWORD flags) {
     return pi.hProcess;
 }
 
+HANDLE LaunchProcessHidden(Str cmdLine, Str currDir) {
+    PROCESS_INFORMATION pi = {nullptr};
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_EXISTING, 0, nullptr);
+    if (nul == INVALID_HANDLE_VALUE) {
+        nul = nullptr;
+    }
+    si.hStdInput = nul;
+    si.hStdOutput = nul;
+    si.hStdError = nul;
+
+    WCHAR* cmdLineW = CWStrTemp(cmdLine);
+    WCHAR* dirW = len(currDir) == 0 ? nullptr : CWStrTemp(currDir);
+    DWORD flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    BOOL ok = CreateProcessW(nullptr, cmdLineW, nullptr, nullptr, TRUE, flags, nullptr, dirW, &si, &pi);
+    if (nul) {
+        CloseHandle(nul);
+    }
+    if (!ok) {
+        return nullptr;
+    }
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+
 bool CreateProcessHelper(Str exe, Str args) {
     if (!args) {
         args = "";

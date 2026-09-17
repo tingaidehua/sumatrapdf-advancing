@@ -296,7 +296,8 @@ enum {
     CmdConvertPdfToImages = 485,
     CmdShowHome = 486,
     CmdToggleLibrary = 487,
-    CmdNone = 488,
+    CmdToggleWebSidebar = 488,
+    CmdNone = 489,
 
     /* range for file history */
     CmdFileHistoryFirst,

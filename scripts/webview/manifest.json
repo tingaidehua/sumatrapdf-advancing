@@ -1,0 +1,57 @@
+{
+  "categories": [
+    {
+      "title": "NotebookLM",
+      "items": [
+        {
+          "title": "配置（每笔记本来源上限等）",
+          "path": "config.json",
+          "run": false,
+          "editable": true
+        },
+        {
+          "title": "添加 PDF → NotebookLM",
+          "path": "notebooklm-add.mjs",
+          "run": true
+        },
+        {
+          "title": "仅选中当前来源",
+          "path": "notebooklm-select.mjs",
+          "run": true
+        },
+        {
+          "title": "对话 chat",
+          "path": "notebooklm-chat.mjs",
+          "run": true,
+          "args": "--q 这本书讲什么？"
+        },
+        {
+          "title": "库 lib/notebooklm.mjs",
+          "path": "lib/notebooklm.mjs",
+          "run": false
+        }
+      ]
+    },
+    {
+      "title": "桥接 / 调试",
+      "items": [
+        {
+          "title": "CLI status",
+          "path": "cli.mjs",
+          "run": true,
+          "args": "status"
+        },
+        {
+          "title": "flywheel",
+          "path": "flywheel.mjs",
+          "run": true
+        },
+        {
+          "title": "bridge.mjs",
+          "path": "lib/bridge.mjs",
+          "run": false
+        }
+      ]
+    }
+  ]
+}

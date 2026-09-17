@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -1148,6 +1148,7 @@
     <ClInclude Include="..\ext\darkmodelib\src\Version.h" />
     <ClInclude Include="..\src\AIChatCommon.h" />
     <ClInclude Include="..\src\AIChatPanel.h" />
+    <ClInclude Include="..\src\WebPanel.h" />
     <ClInclude Include="..\src\Accelerators.h" />
     <ClInclude Include="..\src\Annotation.h" />
     <ClInclude Include="..\src\AppSettings.h" />
@@ -1201,6 +1202,7 @@
     <ClInclude Include="..\src\KeyboardHelp.h" />
     <ClInclude Include="..\src\Library.h" />
     <ClInclude Include="..\src\LibraryPanel.h" />
+    <ClInclude Include="..\src\ScriptManager.h" />
     <ClInclude Include="..\src\LibraryReadingTracker.h" />
     <ClInclude Include="..\src\LibraryStore.h" />
     <ClInclude Include="..\src\LinkFollow.h" />
@@ -1341,6 +1343,7 @@
     <ClCompile Include="..\src\AIAntiGravity.cpp" />
     <ClCompile Include="..\src\AIChatCommon.cpp" />
     <ClCompile Include="..\src\AIChatPanel.cpp" />
+    <ClCompile Include="..\src\WebPanel.cpp" />
     <ClCompile Include="..\src\AIClaudeCode.cpp" />
     <ClCompile Include="..\src\AICodexBuild.cpp" />
     <ClCompile Include="..\src\AIGrokBuild.cpp" />
@@ -1432,6 +1435,7 @@
     <ClCompile Include="..\src\KeyboardHelp_win.cpp" />
     <ClCompile Include="..\src\Library.cpp" />
     <ClCompile Include="..\src\LibraryPanel.cpp" />
+    <ClCompile Include="..\src\ScriptManager.cpp" />
     <ClCompile Include="..\src\LibraryReadingTracker.cpp" />
     <ClCompile Include="..\src\LibraryStore.cpp" />
     <ClCompile Include="..\src\LinkFollow.cpp" />

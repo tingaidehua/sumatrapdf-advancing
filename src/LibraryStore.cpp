@@ -77,6 +77,7 @@ static LibraryBook* ReadBook(sqlite3_stmt* stmt) {
     book->lastReadMs = sqlite3_column_int64(stmt, 5);
     book->sortPos = sqlite3_column_count(stmt) > 6 ? sqlite3_column_int64(stmt, 6) : 0;
     book->bgColor = sqlite3_column_count(stmt) > 7 ? (u32)sqlite3_column_int64(stmt, 7) : 0;
+    book->notebooklm = sqlite3_column_count(stmt) > 8 ? ColumnTextDup(stmt, 8) : Str{};
     return book;
 }
 
@@ -86,6 +87,7 @@ void DeleteLibraryBook(LibraryBook* book) {
     }
     str::Free(book->path);
     str::Free(book->title);
+    str::Free(book->notebooklm);
     delete book;
 }
 
@@ -140,7 +142,8 @@ CREATE TABLE IF NOT EXISTS books (
   last_read_ms INTEGER NOT NULL DEFAULT 0,
   created_ms INTEGER NOT NULL,
   updated_ms INTEGER NOT NULL,
-  bg_color INTEGER NOT NULL DEFAULT 0
+  bg_color INTEGER NOT NULL DEFAULT 0,
+  notebooklm TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS collections (
   id INTEGER PRIMARY KEY,
@@ -171,7 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
 CREATE INDEX IF NOT EXISTS idx_book_collections_collection ON book_collections(collection_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_parent_name
   ON collections(COALESCE(parent_id, 0), name COLLATE NOCASE);
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;
 )sql";
     return Exec(store, sql);
@@ -256,6 +259,15 @@ static bool MigrateToV5(LibraryStore* store) {
     return Exec(store, "PRAGMA user_version = 5");
 }
 
+static bool MigrateToV6(LibraryStore* store) {
+    if (!TableHasColumn(store, "books", "notebooklm")) {
+        if (!Exec(store, "ALTER TABLE books ADD COLUMN notebooklm TEXT NOT NULL DEFAULT ''")) {
+            return false;
+        }
+    }
+    return Exec(store, "PRAGMA user_version = 6");
+}
+
 static int SchemaVersion(LibraryStore* store) {
     sqlite3_stmt* stmt = Prepare(store, "PRAGMA user_version");
     if (!stmt) {
@@ -289,14 +301,14 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     int version = SchemaVersion(store);
-    if (version < 0 || version > 5) {
+    if (version < 0 || version > 6) {
         str::ReplaceWithCopy(&store->error, fmt("unsupported library database version: %d", version));
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
     }
-    if (version < 5) {
-        logf("LibraryStore migrating schema: v%d -> v5\n", version);
+    if (version < 6) {
+        logf("LibraryStore migrating schema: v%d -> v6\n", version);
     }
     if (!CreateSchema(store)) {
         sqlite3_close(store->db);
@@ -311,6 +323,11 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     if (!MigrateToV5(store)) {
+        sqlite3_close(store->db);
+        store->db = nullptr;
+        return store;
+    }
+    if (!MigrateToV6(store)) {
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
@@ -621,11 +638,11 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
     sql.Append(withSortPos ? "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,"
                              : "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,0,");
     if (withSortPos && scope == LibraryBookScope::Collection) {
-        sql.Append("bc.sort_pos,b.bg_color FROM books b ");
+        sql.Append("bc.sort_pos,b.bg_color,b.notebooklm FROM books b ");
     } else if (withSortPos && scope == LibraryBookScope::ManualRoot) {
-        sql.Append("m.sort_pos,b.bg_color FROM books b ");
+        sql.Append("m.sort_pos,b.bg_color,b.notebooklm FROM books b ");
     } else {
-        sql.Append("b.bg_color FROM books b ");
+        sql.Append("b.bg_color,b.notebooklm FROM books b ");
     }
     if (scope == LibraryBookScope::Desk) {
         sql.Append("JOIN desk_books d ON d.book_id=b.id ");
@@ -733,11 +750,20 @@ static int CollectionKind(LibraryStore* store, i64 id) {
 }
 
 LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentId, bool isShelf, Str name) {
-    if (!LibraryStoreIsOpen(store) || !name || (isShelf && parentId != 0) || (!isShelf && parentId == 0)) {
+    if (!LibraryStoreIsOpen(store) || !name) {
         return nullptr;
     }
-    if (!isShelf && CollectionKind(store, parentId) != 1) {
-        return nullptr;
+    // Shelves (kind 1) only at root. Folders/tags (kind 2) may nest under a shelf,
+    // another folder, or sit at the library root — unlimited depth ("a/b/c").
+    if (isShelf) {
+        if (parentId != 0) {
+            return nullptr;
+        }
+    } else if (parentId != 0) {
+        int parentKind = CollectionKind(store, parentId);
+        if (parentKind != 1 && parentKind != 2) {
+            return nullptr;
+        }
     }
     sqlite3_stmt* stmt =
         Prepare(store, "INSERT INTO collections(parent_id,kind,name,created_ms) VALUES(?1,?2,?3,?4) RETURNING id");
@@ -828,12 +854,19 @@ bool LibraryStoreMoveCollection(LibraryStore* store, i64 collectionId, i64 newPa
         return false;
     }
     int sourceKind = CollectionKind(store, collectionId);
-    if (newParentId == 0) {
-        if (sourceKind != 1) {
+    if (sourceKind != 1 && sourceKind != 2) {
+        return false;
+    }
+    // Shelves stay at root only. Folders may move under shelf/folder/root.
+    if (sourceKind == 1) {
+        if (newParentId != 0) {
             return false;
         }
-    } else if (sourceKind != 2 || CollectionKind(store, newParentId) != 1) {
-        return false;
+    } else if (newParentId != 0) {
+        int parentKind = CollectionKind(store, newParentId);
+        if (parentKind != 1 && parentKind != 2) {
+            return false;
+        }
     }
     sqlite3_stmt* check = Prepare(store, R"sql(
 WITH RECURSIVE descendants(id) AS (
@@ -854,9 +887,8 @@ SELECT 1 FROM descendants WHERE id=?2;
         str::ReplaceWithCopy(&store->error, StrL("moving the collection would create a cycle"));
         return false;
     }
-    sqlite3_stmt* stmt = Prepare(store, R"sql(
-UPDATE collections SET parent_id=?1,kind=CASE WHEN ?1 IS NULL THEN 1 ELSE 2 END WHERE id=?2;
-)sql");
+    // Preserve kind: folders remain folders even at root (tags at top level).
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE collections SET parent_id=?1 WHERE id=?2");
     if (!stmt) {
         return false;
     }
@@ -1084,6 +1116,161 @@ bool LibraryStoreSetCollectionBgColor(LibraryStore* store, i64 collectionId, u32
     }
     sqlite3_finalize(stmt);
     return ok;
+}
+
+bool LibraryStoreSetBookNotebookLm(LibraryStore* store, i64 bookId, Str notebooklmJson) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0) {
+        return false;
+    }
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE books SET notebooklm=?1,updated_ms=?2 WHERE id=?3");
+    if (!stmt) {
+        return false;
+    }
+    BindText(stmt, 1, notebooklmJson ? notebooklmJson : StrL(""));
+    sqlite3_bind_int64(stmt, 2, UnixTimeMsNow());
+    sqlite3_bind_int64(stmt, 3, bookId);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+    if (!ok) {
+        SetError(store, StrL("set book notebooklm"));
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+Str LibraryStoreGetBookNotebookLm(LibraryStore* store, i64 bookId) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0) {
+        return {};
+    }
+    sqlite3_stmt* stmt = Prepare(store, "SELECT notebooklm FROM books WHERE id=?1");
+    if (!stmt) {
+        return {};
+    }
+    sqlite3_bind_int64(stmt, 1, bookId);
+    Str out = {};
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out = ColumnTextDup(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+LibraryBook* LibraryStoreFindBookByPath(LibraryStore* store, Str path) {
+    if (!LibraryStoreIsOpen(store) || !path) {
+        return nullptr;
+    }
+    Str key = PathKey(NormalizePathTemp(path));
+    sqlite3_stmt* stmt =
+        Prepare(store, "SELECT id,path,title,open_count,reading_seconds,last_read_ms,0,bg_color,notebooklm "
+                       "FROM books WHERE path_key=?1");
+    if (!stmt) {
+        str::Free(key);
+        return nullptr;
+    }
+    BindText(stmt, 1, key);
+    str::Free(key);
+    LibraryBook* book = nullptr;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        book = ReadBook(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return book;
+}
+
+LibraryBook* LibraryStoreFindBookById(LibraryStore* store, i64 bookId) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0) {
+        return nullptr;
+    }
+    sqlite3_stmt* stmt =
+        Prepare(store, "SELECT id,path,title,open_count,reading_seconds,last_read_ms,0,bg_color,notebooklm "
+                       "FROM books WHERE id=?1");
+    if (!stmt) {
+        return nullptr;
+    }
+    sqlite3_bind_int64(stmt, 1, bookId);
+    LibraryBook* book = nullptr;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        book = ReadBook(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return book;
+}
+
+bool LibraryStoreRenameBookFile(LibraryStore* store, i64 bookId, Str newBaseName, Str* outNewPath) {
+    if (outNewPath) {
+        *outNewPath = {};
+    }
+    if (!LibraryStoreIsOpen(store) || bookId <= 0 || !newBaseName || newBaseName.len == 0) {
+        return false;
+    }
+    // Reject path separators in the new name.
+    if (str::IndexOfChar(newBaseName, '\\') >= 0 || str::IndexOfChar(newBaseName, '/') >= 0 ||
+        str::IndexOfChar(newBaseName, ':') >= 0) {
+        str::ReplaceWithCopy(&store->error, StrL("invalid file name"));
+        return false;
+    }
+    LibraryBook* book = LibraryStoreFindBookById(store, bookId);
+    if (!book || !book->path) {
+        DeleteLibraryBook(book);
+        return false;
+    }
+    TempStr dir = path::GetDirTemp(book->path);
+    TempStr newPath = path::NormalizeTemp(path::JoinTemp(dir, newBaseName));
+    if (str::EqI(book->path, newPath)) {
+        DeleteLibraryBook(book);
+        if (outNewPath) {
+            *outNewPath = str::Dup(newPath);
+        }
+        return true;
+    }
+    if (file::Exists(newPath)) {
+        str::ReplaceWithCopy(&store->error, StrL("target file already exists"));
+        DeleteLibraryBook(book);
+        return false;
+    }
+    Str key = PathKey(newPath);
+    sqlite3_stmt* clash = Prepare(store, "SELECT 1 FROM books WHERE path_key=?1 AND id<>?2");
+    bool conflict = false;
+    if (clash) {
+        BindText(clash, 1, key);
+        sqlite3_bind_int64(clash, 2, bookId);
+        conflict = sqlite3_step(clash) == SQLITE_ROW;
+        sqlite3_finalize(clash);
+    }
+    if (conflict) {
+        str::Free(key);
+        str::ReplaceWithCopy(&store->error, StrL("path already in library"));
+        DeleteLibraryBook(book);
+        return false;
+    }
+    if (!file::Rename(newPath, book->path)) {
+        str::Free(key);
+        str::ReplaceWithCopy(&store->error, StrL("file rename failed"));
+        DeleteLibraryBook(book);
+        return false;
+    }
+    TempStr title = newBaseName;
+    sqlite3_stmt* stmt =
+        Prepare(store, "UPDATE books SET path=?1,path_key=?2,title=?3,updated_ms=?4 WHERE id=?5");
+    bool ok = stmt != nullptr;
+    if (ok) {
+        BindText(stmt, 1, newPath);
+        BindText(stmt, 2, key);
+        BindText(stmt, 3, title);
+        sqlite3_bind_int64(stmt, 4, UnixTimeMsNow());
+        sqlite3_bind_int64(stmt, 5, bookId);
+        ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+        sqlite3_finalize(stmt);
+    }
+    str::Free(key);
+    DeleteLibraryBook(book);
+    if (!ok) {
+        str::ReplaceWithCopy(&store->error, StrL("database update failed after rename"));
+        return false;
+    }
+    if (outNewPath) {
+        *outNewPath = str::Dup(newPath);
+    }
+    return true;
 }
 
 static bool HasPrefixBoundary(Str path, Str prefix) {
@@ -1354,7 +1541,13 @@ void LibraryStore_UnitTests() {
     manualRoot = LibraryStoreGetBooks(store, LibraryBookScope::ManualRoot, 0, LibrarySort::Title, Str());
     utassert(len(manualRoot) == 2 && manualRoot[0]->id == imported->id && manualRoot[1]->id == b->id);
     DeleteLibraryBooks(manualRoot);
-    utassert(!LibraryStoreCreateCollection(store, category->id, false, StrL("Nested")));
+    // Nested folders/tags: category under category is allowed (unlimited depth).
+    LibraryCollection* nested = LibraryStoreCreateCollection(store, category->id, false, StrL("Nested"));
+    utassert(nested);
+    DeleteLibraryCollection(nested);
+    LibraryCollection* rootFolder = LibraryStoreCreateCollection(store, 0, false, StrL("RootTag"));
+    utassert(rootFolder);
+    DeleteLibraryCollection(rootFolder);
     LibraryCollection* other = LibraryStoreCreateCollection(store, shelf->id, false, StrL("Other"));
     utassert(other);
     // Ctrl-drag copies. A later normal drag to the same destination removes
@@ -1381,9 +1574,11 @@ void LibraryStore_UnitTests() {
     LibraryCollection* shelf2 = LibraryStoreCreateCollection(store, 0, true, StrL("More"));
     utassert(shelf2);
     utassert(!LibraryStoreMoveCollection(store, shelf->id, other->id));
-    utassert(!LibraryStoreMoveCollection(store, other->id, category->id));
-    utassert(!LibraryStoreMoveCollection(store, category->id, 0));
-    utassert(LibraryStoreMoveCollection(store, other->id, shelf2->id));
+    // Folder under folder is allowed.
+    utassert(LibraryStoreMoveCollection(store, other->id, category->id));
+    utassert(LibraryStoreMoveCollection(store, other->id, shelf->id));
+    // Folder may return to library root (stays a folder/tag).
+    utassert(LibraryStoreMoveCollection(store, other->id, 0));
     utassert(LibraryStoreMoveCollection(store, other->id, shelf->id));
     utassert(LibraryStoreDeleteCollection(store, shelf2->id));
     DeleteLibraryCollection(shelf2);

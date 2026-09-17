@@ -65,6 +65,7 @@ static ToolbarButtonInfo gToolbarButtons[] = {
     {gIconHome, CmdShowHome, _TRN("Home")},
     {gIconLibrary, CmdToggleLibrary, _TRN("Library")},
     {gIconBookmarks, CmdToggleBookmarks, _TRN("Bookmarks")},
+    {gIconChat, CmdToggleWebSidebar, _TRN("AI Sidebar")},
     {nullptr, 0, nullptr}, // separator
     {gIconFileOpen, CmdOpenFile, _TRN("Open")},
     {gIconPrint, CmdPrint, _TRN("Print")},
@@ -545,6 +546,7 @@ void ToolbarUpdateStateForWindow(MainWindow* win, bool setButtonsVisibility) {
     }
 
     SetToolbarButtonCheckedState(win, CmdToggleLibrary, win->uiState.libraryVisible);
+    SetToolbarButtonCheckedState(win, CmdToggleWebSidebar, win->uiState.webPanelVisible);
     SetToolbarButtonCheckedState(win, CmdToggleBookmarks, win->uiState.tocVisible);
 
     if (setButtonsVisibility) {

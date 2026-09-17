@@ -1399,6 +1399,9 @@ static void CloseAIChatPanelFromLabel(MainWindow* win) {
 // command entry point: toggle the panel for the given provider
 void OnAIChatToggle(MainWindow* win, int providerId) {
     logf("OnAIChatToggle: providerId=%d\n", providerId);
+    if (win) {
+        win->uiState.webPanelVisible = false;
+    }
     AIChatProvider* p = GetAIChatProvider(providerId);
     if (!p) {
         logf("OnAIChatToggle: GetAIChatProvider(%d) returned null\n", providerId);

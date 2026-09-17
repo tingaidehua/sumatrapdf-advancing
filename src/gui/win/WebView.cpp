@@ -470,15 +470,117 @@ static TempStr UrlForWebViewEvent(WStr uri, WStr prefix) {
 }
 
 static void UpdateWebViewHistory(WebviewWnd* wnd) {
-    if (!wnd || !wnd->events.historyChanged || !wnd->webview) {
+    if (!wnd || !wnd->webview) {
         return;
     }
-    BOOL canGoBack = FALSE;
-    BOOL canGoForward = FALSE;
-    wnd->webview->get_CanGoBack(&canGoBack);
-    wnd->webview->get_CanGoForward(&canGoForward);
-    wnd->events.historyChanged(wnd->events.ctx, canGoBack != FALSE, canGoForward != FALSE);
+    if (wnd->events.historyChanged) {
+        BOOL canGoBack = FALSE;
+        BOOL canGoForward = FALSE;
+        wnd->webview->get_CanGoBack(&canGoBack);
+        wnd->webview->get_CanGoForward(&canGoForward);
+        wnd->events.historyChanged(wnd->events.ctx, canGoBack != FALSE, canGoForward != FALSE);
+    }
+    // SPA pushState often updates Source without NavigationCompleted.
+    if (wnd->events.sourceChanged) {
+        WCHAR* uri = nullptr;
+        wnd->webview->get_Source(&uri);
+        TempStr url = UrlForWebViewEvent(WStr(uri), wnd->resourceUriPrefix);
+        if (uri) {
+            CoTaskMemFree(uri);
+        }
+        if (url) {
+            wnd->events.sourceChanged(wnd->events.ctx, wnd, url);
+        }
+    }
 }
+
+class webview2_source_changed_handler : public ICoreWebView2SourceChangedEventHandler {
+  public:
+    explicit webview2_source_changed_handler(WebviewWnd* wnd) : m_wnd(wnd) {}
+    ULONG STDMETHODCALLTYPE AddRef() { return ++m_refCount; }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG n = --m_refCount;
+        if (n == 0) {
+            delete this;
+        }
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppv) {
+        if (!ppv) {
+            return E_POINTER;
+        }
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == __uuidof(ICoreWebView2SourceChangedEventHandler)) {
+            *ppv = static_cast<ICoreWebView2SourceChangedEventHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/, ICoreWebView2SourceChangedEventArgs* /*args*/) {
+        if (!m_wnd || !m_wnd->webview || !m_wnd->events.sourceChanged) {
+            return S_OK;
+        }
+        WCHAR* uri = nullptr;
+        m_wnd->webview->get_Source(&uri);
+        TempStr url = UrlForWebViewEvent(WStr(uri), m_wnd->resourceUriPrefix);
+        if (uri) {
+            CoTaskMemFree(uri);
+        }
+        if (url) {
+            m_wnd->events.sourceChanged(m_wnd->events.ctx, m_wnd, url);
+        }
+        return S_OK;
+    }
+
+  private:
+    WebviewWnd* m_wnd = nullptr;
+    ULONG m_refCount = 1;
+};
+
+class webview2_document_title_changed_handler : public ICoreWebView2DocumentTitleChangedEventHandler {
+  public:
+    explicit webview2_document_title_changed_handler(WebviewWnd* wnd) : m_wnd(wnd) {}
+    ULONG STDMETHODCALLTYPE AddRef() { return ++m_refCount; }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG n = --m_refCount;
+        if (n == 0) {
+            delete this;
+        }
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppv) {
+        if (!ppv) {
+            return E_POINTER;
+        }
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == __uuidof(ICoreWebView2DocumentTitleChangedEventHandler)) {
+            *ppv = static_cast<ICoreWebView2DocumentTitleChangedEventHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/, IUnknown* /*args*/) {
+        if (!m_wnd || !m_wnd->webview || !m_wnd->events.documentTitleChanged) {
+            return S_OK;
+        }
+        WCHAR* titleW = nullptr;
+        m_wnd->webview->get_DocumentTitle(&titleW);
+        TempStr title = titleW ? ToUtf8Temp(titleW) : TempStr{};
+        if (titleW) {
+            CoTaskMemFree(titleW);
+        }
+        if (title) {
+            m_wnd->events.documentTitleChanged(m_wnd->events.ctx, m_wnd, title);
+        }
+        return S_OK;
+    }
+
+  private:
+    WebviewWnd* m_wnd = nullptr;
+    ULONG m_refCount = 1;
+};
 
 class webview2_navigation_starting_handler : public ICoreWebView2NavigationStartingEventHandler {
   public:
@@ -767,6 +869,101 @@ class webview2_env_handler : public ICoreWebView2CreateCoreWebView2EnvironmentCo
 
   private:
     env_ready_cb_t m_cb;
+    ULONG m_refCount = 1;
+};
+
+// Completes a dedicated (non-shared) environment create. Multiple WebviewWnds
+// with the same userDataFolder share one environment (WebView2 allows only one
+// env per folder) so the web panel can keep a tab WebView per pin.
+enum class DedicatedEnvState { NotStarted, Creating, Ready, Failed };
+
+struct DedicatedEnvSlot {
+    WStr folder;
+    ICoreWebView2Environment* env = nullptr;
+    DedicatedEnvState state = DedicatedEnvState::NotStarted;
+    Vec<WebviewWnd*> pending;
+};
+
+static Vec<DedicatedEnvSlot*> gDedicatedEnvs;
+
+static DedicatedEnvSlot* FindDedicatedEnvSlot(WStr folder) {
+    for (DedicatedEnvSlot* s : gDedicatedEnvs) {
+        if (s && wstr::Eq(s->folder, folder)) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+static DedicatedEnvSlot* GetOrCreateDedicatedEnvSlot(WStr folder) {
+    DedicatedEnvSlot* s = FindDedicatedEnvSlot(folder);
+    if (s) {
+        return s;
+    }
+    s = new DedicatedEnvSlot();
+    s->folder = wstr::Dup(folder);
+    gDedicatedEnvs.Append(s);
+    return s;
+}
+
+static void CreateControllerWithDedicatedEnvironment(WebviewWnd* self, ICoreWebView2Environment* env);
+
+class webview2_dedicated_env_handler : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
+  public:
+    explicit webview2_dedicated_env_handler(DedicatedEnvSlot* slot) : m_slot(slot) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() { return ++m_refCount; }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG n = --m_refCount;
+        if (n == 0) {
+            delete this;
+        }
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppv) {
+        if (!ppv) {
+            return E_POINTER;
+        }
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == __uuidof(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT res, ICoreWebView2Environment* env);
+
+  private:
+    DedicatedEnvSlot* m_slot = nullptr;
+    ULONG m_refCount = 1;
+};
+
+class webview2_cdp_handler : public ICoreWebView2CallDevToolsProtocolMethodCompletedHandler {
+  public:
+    ULONG STDMETHODCALLTYPE AddRef() { return ++m_refCount; }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG n = --m_refCount;
+        if (n == 0) {
+            delete this;
+        }
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppv) {
+        if (!ppv) {
+            return E_POINTER;
+        }
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == __uuidof(ICoreWebView2CallDevToolsProtocolMethodCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT /*errorCode*/, LPCWSTR /*result*/) { return S_OK; }
+
+  private:
     ULONG m_refCount = 1;
 };
 
@@ -1274,11 +1471,16 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
     ICoreWebView2Settings* settings = nullptr;
     HRESULT hr = webview->get_Settings(&settings);
     if (hr == S_OK && settings) {
-        settings->put_AreDefaultContextMenusEnabled(FALSE);
-        settings->put_AreDevToolsEnabled(FALSE);
-        settings->put_AreDefaultScriptDialogsEnabled(FALSE);
+        settings->put_AreDefaultContextMenusEnabled(useDedicatedEnvironment ? TRUE : FALSE);
+        settings->put_AreDevToolsEnabled(enableDevTools ? TRUE : FALSE);
+        settings->put_AreDefaultScriptDialogsEnabled(useDedicatedEnvironment ? TRUE : FALSE);
         settings->put_IsStatusBarEnabled(FALSE);
-        settings->put_IsZoomControlEnabled(FALSE);
+        settings->put_IsZoomControlEnabled(useDedicatedEnvironment ? TRUE : FALSE);
+        ICoreWebView2Settings2* settings2 = nullptr;
+        if (userAgent && SUCCEEDED(settings->QueryInterface(IID_PPV_ARGS(&settings2))) && settings2) {
+            settings2->put_UserAgent(CWStrTemp(userAgent));
+            settings2->Release();
+        }
         settings->Release();
     }
 
@@ -1305,7 +1507,8 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
         resourceHandler->Release();
     }
 
-    if (events.navigationStarting || events.navigationCompleted || events.historyChanged) {
+    if (events.navigationStarting || events.navigationCompleted || events.historyChanged || events.sourceChanged ||
+        events.documentTitleChanged) {
         ::EventRegistrationToken token = {};
         if (events.navigationStarting) {
             auto* handler = new webview2_navigation_starting_handler(this);
@@ -1320,9 +1523,19 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
             webview->add_NavigationCompleted(handler, &token);
             handler->Release();
         }
-        if (events.historyChanged) {
+        if (events.historyChanged || events.sourceChanged) {
             auto* handler = new webview2_history_changed_handler(this);
             webview->add_HistoryChanged(handler, &token);
+            handler->Release();
+        }
+        if (events.sourceChanged) {
+            auto* handler = new webview2_source_changed_handler(this);
+            webview->add_SourceChanged(handler, &token);
+            handler->Release();
+        }
+        if (events.documentTitleChanged) {
+            auto* handler = new webview2_document_title_changed_handler(this);
+            webview->add_DocumentTitleChanged(handler, &token);
             handler->Release();
         }
     }
@@ -1357,6 +1570,10 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
     initStarted = true;
     FlushPendingOps();
 
+    if (emulateMobile) {
+        ApplyMobileEmulation();
+    }
+
     // honor desiredVisible (SetControllerVisible) so BrowserDocView can create
     // hidden during a tab probe without the async ready callback showing it
     bool wantVisible = desiredVisible && ShouldWebviewBeVisible(hwnd);
@@ -1383,6 +1600,9 @@ void WebviewWnd::UpdateWebviewSize() {
     hasLastBounds = true;
     RECT r = ToRECT(bounds);
     controller->put_Bounds(r);
+    if (emulateMobile) {
+        ApplyMobileEmulation();
+    }
 }
 
 void WebviewWnd::Eval(Str js) {
@@ -1674,6 +1894,12 @@ void WebviewWnd::Navigate(Str url) {
     webview->Navigate(ws);
 }
 
+void WebviewWnd::Reload() {
+    if (webview) {
+        webview->Reload();
+    }
+}
+
 void WebviewWnd::GoBack() {
     if (webview) {
         webview->GoBack();
@@ -1718,6 +1944,32 @@ bool WebviewWnd::CanGoForward() const {
     BOOL canGoForward = FALSE;
     webview->get_CanGoForward(&canGoForward);
     return canGoForward != FALSE;
+}
+
+TempStr WebviewWnd::GetSourceTemp() const {
+    if (!webview) {
+        return {};
+    }
+    WCHAR* uri = nullptr;
+    webview->get_Source(&uri);
+    TempStr url = UrlForWebViewEvent(WStr(uri), resourceUriPrefix);
+    if (uri) {
+        CoTaskMemFree(uri);
+    }
+    return url;
+}
+
+TempStr WebviewWnd::GetDocumentTitleTemp() const {
+    if (!webview) {
+        return {};
+    }
+    WCHAR* titleW = nullptr;
+    webview->get_DocumentTitle(&titleW);
+    TempStr title = titleW ? ToUtf8Temp(titleW) : TempStr{};
+    if (titleW) {
+        CoTaskMemFree(titleW);
+    }
+    return title;
 }
 
 void WebviewWnd::Focus() {
@@ -2028,6 +2280,49 @@ bool WebviewWnd::Embed(WebViewMsgCb& cb) {
     wstr::Free(userDataFolder);
     userDataFolder = wstr::Dup(ToWStrTemp(dataDir));
 
+    if (useDedicatedEnvironment) {
+        DedicatedEnvSlot* slot = GetOrCreateDedicatedEnvSlot(userDataFolder);
+        slot->pending.Append(this);
+        if (slot->state == DedicatedEnvState::Ready && slot->env) {
+            Vec<WebviewWnd*> pending = slot->pending;
+            slot->pending.Reset();
+            for (WebviewWnd* wv : pending) {
+                CreateControllerWithDedicatedEnvironment(wv, slot->env);
+            }
+            return !initFailed;
+        }
+        if (slot->state == DedicatedEnvState::Creating) {
+            return true;
+        }
+        if (slot->state == DedicatedEnvState::Failed) {
+            slot->pending.Reset();
+            FailInit();
+            return false;
+        }
+        slot->state = DedicatedEnvState::Creating;
+        auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+        Str args = dedicatedBrowserArgs ? dedicatedBrowserArgs : Str{};
+        if (args) {
+            options->put_AdditionalBrowserArguments(CWStrTemp(args));
+        }
+        auto* envHandler = new webview2_dedicated_env_handler(slot);
+        HRESULT hr =
+            CreateCoreWebView2EnvironmentWithOptions(nullptr, userDataFolder.s, options.Get(), envHandler);
+        envHandler->Release();
+        if (FAILED(hr)) {
+            logf("WebView2: dedicated CreateCoreWebView2EnvironmentWithOptions failed 0x%x\n", (int)hr);
+            slot->state = DedicatedEnvState::Failed;
+            for (WebviewWnd* wv : slot->pending) {
+                if (wv) {
+                    wv->FailInit();
+                }
+            }
+            slot->pending.Reset();
+            return false;
+        }
+        return true;
+    }
+
     if (gSharedEnvState == SharedWebViewEnvState::Ready && gSharedEnvironment) {
         CreateControllerWithSharedEnvironment(this, cb);
         return !initFailed;
@@ -2060,6 +2355,101 @@ bool WebviewWnd::Embed(WebViewMsgCb& cb) {
     }
 
     return true;
+}
+
+static void CreateControllerWithDedicatedEnvironment(WebviewWnd* self, ICoreWebView2Environment* env) {
+    if (!self || !env || self->initFailed) {
+        if (self && !self->initFailed) {
+            self->FailInit();
+        }
+        return;
+    }
+    HWND hwnd = self->hwnd;
+    auto msgCb = MkFunc1<void, Str>(OnBrowserMessageCbHwnd, (void*)hwnd);
+    auto ctrlCb = MkFunc1<void, ICoreWebView2Controller*>(ComHandlerCbHwnd, (void*)hwnd);
+    auto* handler = new webview2_com_handler(hwnd, msgCb, ctrlCb, self->allowClipboardRead);
+    HRESULT hr = env->CreateCoreWebView2Controller(hwnd, handler);
+    handler->Release();
+    if (FAILED(hr)) {
+        self->FailInit();
+    }
+}
+
+HRESULT webview2_dedicated_env_handler::Invoke(HRESULT res, ICoreWebView2Environment* env) {
+    if (!m_slot) {
+        return S_OK;
+    }
+    if (FAILED(res) || !env) {
+        logf("WebView2: dedicated environment failed 0x%x\n", (int)res);
+        m_slot->state = DedicatedEnvState::Failed;
+        Vec<WebviewWnd*> pending = m_slot->pending;
+        m_slot->pending.Reset();
+        for (WebviewWnd* wv : pending) {
+            if (wv && !wv->initFailed) {
+                wv->FailInit();
+            }
+        }
+        return S_OK;
+    }
+    env->AddRef();
+    m_slot->env = env;
+    m_slot->state = DedicatedEnvState::Ready;
+    Vec<WebviewWnd*> pending = m_slot->pending;
+    m_slot->pending.Reset();
+    for (WebviewWnd* wv : pending) {
+        CreateControllerWithDedicatedEnvironment(wv, env);
+    }
+    return S_OK;
+}
+
+void WebviewWnd::CallDevTools(Str method, Str paramsJson) {
+    if (!webview || !method) {
+        return;
+    }
+    auto* handler = new webview2_cdp_handler();
+    HRESULT hr = webview->CallDevToolsProtocolMethod(CWStrTemp(method), CWStrTemp(paramsJson ? paramsJson : "{}"),
+                                                     handler);
+    handler->Release();
+    if (FAILED(hr)) {
+        logf("WebView2: CallDevToolsProtocolMethod(%s) failed 0x%x\n", method, (int)hr);
+    }
+}
+
+void WebviewWnd::ApplyMobileEmulation() {
+    if (!webview || !emulateMobile) {
+        return;
+    }
+    // Never override device metrics to a made-up phone size. That fights
+    // WebView2's real HWND viewport and crops the page (input bar / side chrome
+    // cut off). Keep mobile UA + touch so sites still serve a narrow layout;
+    // the page then reflows to the control's actual CSS size like a browser.
+    if (mobileDeviceWidth > 0 && mobileDeviceHeight > 0) {
+        int w = mobileDeviceWidth;
+        int h = mobileDeviceHeight;
+        float scale = mobileDeviceScale > 0 ? mobileDeviceScale : 1.0f;
+        TempStr params = fmt(
+            "{\"width\":%d,\"height\":%d,\"deviceScaleFactor\":%.2f,\"mobile\":true,"
+            "\"screenWidth\":%d,\"screenHeight\":%d}",
+            w, h, (double)scale, w, h);
+        CallDevTools("Emulation.setDeviceMetricsOverride", params);
+    } else {
+        CallDevTools("Emulation.clearDeviceMetricsOverride", "{}");
+    }
+    CallDevTools("Emulation.setTouchEmulationEnabled", "{\"enabled\":true,\"configuration\":\"mobile\"}");
+    if (userAgent) {
+        str::Builder uaJson;
+        uaJson.AppendChar('"');
+        for (int i = 0; i < userAgent.len; i++) {
+            char c = userAgent.s[i];
+            if (c == '"' || c == '\\') {
+                uaJson.AppendChar('\\');
+            }
+            uaJson.AppendChar(c);
+        }
+        uaJson.AppendChar('"');
+        TempStr uaParams = fmt("{\"userAgent\":%s,\"platform\":\"iPhone\"}", ToStrTemp(uaJson));
+        CallDevTools("Emulation.setUserAgentOverride", uaParams);
+    }
 }
 
 void WebviewWnd::OnBrowserMessage(Str msg) {
@@ -2203,6 +2593,8 @@ WebviewWnd::~WebviewWnd() {
         controller = nullptr;
     }
     str::Free(dataDir);
+    str::Free(dedicatedBrowserArgs);
+    str::Free(userAgent);
     wstr::Free(userDataFolder);
     wstr::Free(resourceUriPrefix);
 }
@@ -2214,6 +2606,8 @@ WebviewWnd::~WebviewWnd() {
 WebviewWnd::WebviewWnd() = default;
 WebviewWnd::~WebviewWnd() {
     str::Free(dataDir);
+    str::Free(dedicatedBrowserArgs);
+    str::Free(userAgent);
     wstr::Free(userDataFolder);
     wstr::Free(resourceUriPrefix);
 }
@@ -2245,6 +2639,7 @@ void WebviewWnd::OnJsNotify(Str) {}
 void WebviewWnd::RebuildBindScript() {}
 void WebviewWnd::OnProcessFailed(WebViewProcessFailure) {}
 void WebviewWnd::Navigate(Str) {}
+void WebviewWnd::Reload() {}
 void WebviewWnd::RegisterForwardingDropTarget() {}
 void WebviewWnd::RevokeForwardingDropTarget() {}
 void WebviewWnd::GoBack() {}
@@ -2277,4 +2672,6 @@ void WebviewWnd::OnSize(WindowBase::SizeEvent*) {}
 void WebviewWnd::OnActivate(WindowBase::ActivateEvent*) {}
 void WebviewWnd::OnShowWindow(WindowBase::ShowWindowEvent*) {}
 void WebviewWnd::UpdateWebviewSize() {}
+void WebviewWnd::CallDevTools(Str, Str) {}
+void WebviewWnd::ApplyMobileEmulation() {}
 #endif // !_MSC_VER

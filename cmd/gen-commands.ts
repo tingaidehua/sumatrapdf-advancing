@@ -296,6 +296,7 @@ export const commands = [
     "CmdConvertPdfToImages", "Convert PDF to Images...",
     "CmdShowHome", "Show Home",
     "CmdToggleLibrary", "Toggle Library",
+    "CmdToggleWebSidebar", "Toggle AI Sidebar",
     "CmdNone", "Do nothing",
 ];
 

@@ -26,12 +26,20 @@ struct DropDown;
 struct Checkbox;
 struct VirtButton;
 struct VirtIconButton;
+struct VirtCtrl;
 struct TabsCtrl;
 struct TocTree;
 struct TocItem;
 struct FindBarWnd;
 struct FindWindowWnd;
 struct ToolbarVirt;
+
+struct WebPanelTab {
+    Str id;    // stable id persisted across Sumatra restarts
+    Str url;
+    Str title; // document title (Chrome-like); falls back to host/url
+    WebviewWnd* wv = nullptr;
+};
 
 constexpr int kMaxKeyboardLinkHintLength = 9;
 
@@ -245,6 +253,9 @@ struct MainWindow {
     Point libraryDragStart;
     bool libraryDragging = false;
     bool libraryDropAfter = false;
+    // Multi-select (Ctrl/Shift) for books; TreeView still has a single "primary" selection.
+    Vec<uintptr_t> libraryMultiSelected;
+    uintptr_t librarySelectAnchor = 0;
     Vec<i64> expandedLibraryCollections;
     bool libraryExpansionInitialized = false;
     bool libraryModelFiltered = false;
@@ -276,6 +287,8 @@ struct MainWindow {
     WebviewWnd* aiChatWebView = nullptr;
     bool aiChatWebViewReady = false;
     VirtSplitter* aiChatSplitter = nullptr;
+    // Dedicated splitter/slot for the Web sidebar (independent of AI chat)
+    VirtSplitter* webPanelSplitter = nullptr;
     // VBox(label, session combo, webview slot, input row, options row);
     // owns those controls and lays them out in hwndAiChatBox
     ILayout* aiChatLayout = nullptr;
@@ -286,6 +299,26 @@ struct MainWindow {
 
     // width of the AI chat sidebar
     int aiChatDx = 0;
+
+    // Generic Web sidebar — own slot/splitter, not shared with AI chat
+    HWND hwndWebPanelBox = nullptr;
+    VirtText* webPanelLabel = nullptr;
+    HBox* webPanelHeader = nullptr;
+    VirtRoot* webPanelRoot = nullptr;
+    ILayout* webPanelLayout = nullptr;
+    Spacer* webPanelWebViewSlot = nullptr;
+    WebviewWnd* webPanelWebView = nullptr;
+    bool webPanelWebViewReady = false;
+    VirtIconButton* webPanelBookmarksBtn = nullptr;
+    VirtIconButton* webPanelTabsBtn = nullptr;
+    VirtIconButton* webPanelNotebookLmBtn = nullptr;
+    VirtIconButton* webPanelFocusPdfBtn = nullptr;
+    VirtIconButton* webPanelRefreshBtn = nullptr;
+    Vec<WebPanelTab> webPanelTabs;
+    int webPanelActiveTab = -1;
+    Str webPanelCurrentUrl;
+    int webPanelCdpPort = 0;
+    int webPanelDx = 0;
 
     // vertical splitter for resizing left side panel
     // the splitters are virtual controls living in the frame's own tree
@@ -416,6 +449,7 @@ struct MainWindow {
     HwndSlot* fullFavSlot = nullptr;
     HwndSlot* canvasSlot = nullptr;
     HwndSlot* aiChatSlot = nullptr;
+    HwndSlot* webPanelSlot = nullptr;
     HwndSlot* tabsSlot = nullptr;
     HwndSlot* menuSlot = nullptr;
     HwndSlot* toolbarTopSlot = nullptr;
@@ -491,6 +525,7 @@ struct MainWindow {
             bool favoritesAsTab = false;
             bool showMenuBarRebar = false;
             bool aiChatVisible = false;
+            bool webPanelVisible = false;
             int aiChatDx = 0;
             bool sidebarOnRight = false;
         };
@@ -502,6 +537,7 @@ struct MainWindow {
         bool libraryVisible = false;
         bool favVisible = false;
         bool aiChatVisible = false;
+        bool webPanelVisible = false;
         bool updatePending = false; // a FrameUpdateUi uitask is queued
         bool toolbarDirty = false;  // repaint the toolbar on the next update
         bool tabsDirty = false;     // repaint the tab bar on the next update

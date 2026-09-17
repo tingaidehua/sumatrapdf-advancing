@@ -20,7 +20,8 @@ src/.vscode
 tools/pdfjs/coverage/
 cppcheck.out.txt
 clangtidy.out.txt
-node_modules
+node_modules/
+**/node_modules/
 
 .claude/settings.local.json
 pipe-preview-results
@@ -51,3 +52,8 @@ tests/tmp/
 /terminals
 /mcps/tasks/tools
 /bin/resvg.exe
+
+# WebPanel Node/Playwright helpers: keep sources, ignore runtime install/profile junk
+scripts/webview/manager/webview2/
+scripts/webview/.cache/
+**/playwright/.local-browsers/

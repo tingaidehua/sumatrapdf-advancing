@@ -317,6 +317,10 @@ static MenuDef menuDefView[] = {
         CmdAIChatWithAntiGravity,
     },
     {
+        _TRN("AI Sidebar"),
+        CmdToggleWebSidebar,
+    },
+    {
         nullptr,
         0,
     },

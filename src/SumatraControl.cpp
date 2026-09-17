@@ -50,6 +50,7 @@
 #include "CommandPalette.h"
 #include "PdfTools.h"
 #include "LibraryPanel.h"
+#include "WebPanel.h"
 
 extern bool gIsStartup;
 TempStr FindHistoryResultTemp(int* exitCodeOut);
@@ -525,6 +526,7 @@ enum class ControlCmd : u16 {
     TestLayout = 70,
     TestDpi = 71,
     TestLibrary = 72,
+    TestWebPanel = 73,
 };
 
 enum class ControlArgType : u16 {
@@ -1319,6 +1321,24 @@ static void ExecuteControlRequest(ControlRequest* req) {
             }
             int exitCode = 0;
             Str res = LibraryDbgControlTemp(action, argA, argB, n1, n2, &exitCode);
+            AppendTestResult(req, exitCode, res);
+            break;
+        }
+
+        case ControlCmd::TestWebPanel: {
+            Str action = StringArg(req, 0);
+            Str argA = StringArg(req, 1);
+            Str argB = StringArg(req, 2);
+            i32 n1 = 0;
+            i32 n2 = 0;
+            IntArg(req, 1, n1);
+            IntArg(req, 2, n2);
+            if (!action) {
+                AppendError(req, "TestWebPanel expects string action");
+                break;
+            }
+            int exitCode = 0;
+            Str res = WebPanelDbgControlTemp(action, argA, argB, n1, n2, &exitCode);
             AppendTestResult(req, exitCode, res);
             break;
         }

@@ -1,0 +1,7 @@
+{
+  "sourcesPerNotebook": 50,
+  "maxNotebooks": 40,
+  "notebookNamePrefix": "SumatraPDF",
+  "cdpPreferredPort": 9224,
+  "uploadMaxMb": 200
+}

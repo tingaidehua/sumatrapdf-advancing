@@ -378,6 +378,8 @@ void AddPathToRecentDocs(Str path);
 
 HANDLE LaunchProcessWithCmdLine(Str exe, Str cmdLine);
 HANDLE LaunchProcessInDir(Str cmdLine, Str currDir = Str(), DWORD flags = 0);
+// Launch a console app with no visible window (CREATE_NO_WINDOW + hidden STARTUPINFO + NUL stdio).
+HANDLE LaunchProcessHidden(Str cmdLine, Str currDir = Str());
 bool CreateProcessHelper(Str exe, Str args);
 bool LaunchFileShell(Str path, Str params = Str(), Str verb = Str(), bool hidden = false);
 bool LaunchBrowser(Str url);

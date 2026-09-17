@@ -8,6 +8,8 @@ bool HasWebView();
 typedef interface ICoreWebView2 ICoreWebView2;
 typedef interface ICoreWebView2Controller ICoreWebView2Controller;
 
+struct WebviewWnd;
+
 using WebViewMsgCb = Func1<Str>;
 
 struct WebViewResourceResult {
@@ -37,6 +39,10 @@ struct WebViewEvents {
     bool (*navigationStarting)(void* ctx, Str url, bool newWindow) = nullptr;
     void (*navigationCompleted)(void* ctx, Str url, bool success) = nullptr;
     void (*historyChanged)(void* ctx, bool canGoBack, bool canGoForward) = nullptr;
+    // Source / title updates (includes SPA pushState where NavigationCompleted may not fire).
+    // sender is the WebviewWnd that raised the event (needed when one ctx owns many tabs).
+    void (*sourceChanged)(void* ctx, WebviewWnd* sender, Str url) = nullptr;
+    void (*documentTitleChanged)(void* ctx, WebviewWnd* sender, Str title) = nullptr;
     // maps an accelerator key press inside the webview to an app command id to
     // post (WM_COMMAND) to the top-level window, or 0 to leave it to the
     // webview, or kWebViewForwardKey to re-post the key itself. Lets the host
@@ -106,6 +112,7 @@ struct WebviewWnd : WindowBase {
     void RemoveAllInitScripts();
     void OnInitScriptAdded(int token, const WCHAR* id);
     void Navigate(Str url);
+    void Reload();
     void Bind(Str name);
     void Unbind(Str name);
     void Resolve(Str id, int status, Str resultJson);
@@ -118,6 +125,8 @@ struct WebviewWnd : WindowBase {
     int GetZoomPercent() const;
     bool CanGoBack() const;
     bool CanGoForward() const;
+    TempStr GetSourceTemp() const;
+    TempStr GetDocumentTitleTemp() const;
     void Focus();
     void ShowFindUI();
     void RegisterForwardingDropTarget();
@@ -179,6 +188,28 @@ struct WebviewWnd : WindowBase {
     // when true, cancel in-webview downloads and open external http(s) URLs in
     // the OS default browser instead of WebView2's download UI (issue #5920)
     bool routeDownloadsToOsBrowser = false;
+    // when true, create a private WebView2 environment for this control instead
+    // of joining the process-wide shared offline environment (needed for a
+    // persistent browsing profile, remote debugging, and a custom user agent)
+    bool useDedicatedEnvironment = false;
+    // appended to AdditionalBrowserArguments when useDedicatedEnvironment is set
+    // (e.g. --remote-debugging-port=9223)
+    Str dedicatedBrowserArgs;
+    // when non-empty, applied via ICoreWebView2Settings2::put_UserAgent
+    Str userAgent;
+    // when true, leave DevTools enabled (required for CDP / remote debugging)
+    bool enableDevTools = false;
+    // when true, sites should get a mobile layout (UA + Emulation device metrics).
+    // Metrics follow the HWND client size so the page reflows like a resized
+    // mobile browser (fixed phone CSS caused sidebar crop / scrollbars).
+    bool emulateMobile = false;
+    // 0 = use HWND client size; non-zero keeps a fixed CSS width override
+    int mobileDeviceWidth = 0;
+    int mobileDeviceHeight = 0;
+    // 1.0 keeps 1 CSS px ≈ 1 HWND px (no crop). Higher values zoom/crop.
+    float mobileDeviceScale = 1.0f;
+    void ApplyMobileEmulation();
+    void CallDevTools(Str method, Str paramsJson);
     Vec<PendingWebViewOp> pendingOps;
     Vec<WebViewInitScript> initScripts;
     int nextInitScriptToken = 1;

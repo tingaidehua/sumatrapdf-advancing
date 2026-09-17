@@ -110,6 +110,7 @@
 #include "EditAnnotations.h"
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
+#include "WebPanel.h"
 #include "SelectionTranslate.h"
 #include "SelectionHandlers.h"
 #include "CommandPalette.h"
@@ -2724,7 +2725,8 @@ void FrameSyncSplitters(MainWindow* win) {
     if (win->captionLayout) {
         CollectVirtCtrls(win->captionLayout, tops);
     }
-    VirtSplitter* all[] = {win->librarySplitter, win->sidebarSplitter, win->favSplitter, win->aiChatSplitter};
+    VirtSplitter* all[] = {win->librarySplitter, win->sidebarSplitter, win->favSplitter, win->aiChatSplitter,
+                           win->webPanelSplitter};
     for (VirtSplitter* s : all) {
         if (s) {
             tops.Append(s);
@@ -2831,6 +2833,7 @@ static void CreateFrameLayout(MainWindow* win) {
     win->fullFavSlot = new HwndSlot();
     win->canvasSlot = new HwndSlot();
     win->aiChatSlot = new HwndSlot();
+    win->webPanelSlot = new HwndSlot();
     win->tabsSlot = new HwndSlot();
     win->tabsSlot->mapRtlX = true;
     win->menuSlot = new HwndSlot();
@@ -2844,6 +2847,8 @@ static void CreateFrameLayout(MainWindow* win) {
     // when the drag ends
     win->aiChatSplitter = NewFrameSplitter(SplitterType::Vert, false);
     win->aiChatSplitter->thickness = kSplitterDx;
+    win->webPanelSplitter = NewFrameSplitter(SplitterType::Vert, false);
+    win->webPanelSplitter->thickness = kSplitterDx;
 
     auto* sidebar = new VBox();
     sidebar->alignCross = CrossAxisAlign::Stretch;
@@ -2865,6 +2870,8 @@ static void CreateFrameLayout(MainWindow* win) {
     row->AddChild(content, 1);
     row->AddChild(win->aiChatSplitter);
     row->AddChild(win->aiChatSlot);
+    row->AddChild(win->webPanelSplitter);
+    row->AddChild(win->webPanelSlot);
     win->frameLayout = row;
 
     auto* chrome = new VBox();
@@ -2903,6 +2910,7 @@ static void CreateSidebar(MainWindow* win) {
     CreateFavorites(win);
 
     CreateAIChatPanel(win);
+    CreateWebPanel(win);
 
     win->libraryDx = gGlobalPrefs->libraryDx;
     win->uiState.libraryVisible = gGlobalPrefs->showLibrary && LibraryIsAvailable();
@@ -2926,6 +2934,10 @@ static void UpdateToolbarSidebarText(MainWindow* win) {
     win->favLabel->SetText(_TRA("Favorites"));
     win->favLabel->Invalidate();
     UpdateLibraryPanelText(win);
+    if (win->webPanelLabel) {
+        win->webPanelLabel->SetText(_TRA("AI"));
+        win->webPanelLabel->Invalidate();
+    }
 }
 
 static Color DwmFrameBorderColorForCurrentTheme() {
@@ -3300,6 +3312,7 @@ void UpdateAfterThemeChange() {
         UpdateFindWindowTheme(win);
         RefreshSelectionToolbarIcons(win);
         UpdateAIChatTheme(win);
+        UpdateWebPanelTheme(win);
         DarkModeApplyToFrameAfterThemeChange(win);
         UpdateWindowFrameBorderColor(win);
         // TODO: this only rerenders canvas, not frame, even with
@@ -4632,11 +4645,16 @@ void LoadModelIntoTab(WindowTab* tab) {
 
     if (IsMainWindowValid(win)) {
         bool aiChatWas = win->uiState.aiChatVisible;
+        bool webWas = win->uiState.webPanelVisible;
         AIChatSyncPanelsToCurrentTab(win);
-        if (aiChatWas != win->uiState.aiChatVisible) {
+        if (win->uiState.aiChatVisible) {
+            win->uiState.webPanelVisible = false;
+        }
+        if (aiChatWas != win->uiState.aiChatVisible || webWas != win->uiState.webPanelVisible) {
             ScheduleUiUpdate(win);
         }
         OnAIChatTabChanged(win);
+        WebPanelOnDocumentChanged(win);
         LibraryUpdateReadingActivity();
         SyncLibrarySelection(win);
         logf("LoadModelIntoTab: end path='%s' tocVis=%d libraryDx=%d sidebarDx=%d elapsedMs=%llu\n",
@@ -6723,7 +6741,8 @@ static bool IsUiLayoutEq(UILayout* s1, UILayout* s2) {
            s1->isToolbarVisible == s2->isToolbarVisible && s1->tocVisible == s2->tocVisible &&
            s1->libraryVisible == s2->libraryVisible && s1->showFavorites == s2->showFavorites &&
            s1->favoritesAsTab == s2->favoritesAsTab && s1->showMenuBarRebar == s2->showMenuBarRebar &&
-           s1->aiChatVisible == s2->aiChatVisible && s1->aiChatDx == s2->aiChatDx &&
+           s1->aiChatVisible == s2->aiChatVisible && s1->webPanelVisible == s2->webPanelVisible &&
+           s1->aiChatDx == s2->aiChatDx &&
            s1->sidebarOnRight == s2->sidebarOnRight;
 }
 
@@ -6848,6 +6867,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     curState.favoritesAsTab = favAsTabNow;
     curState.showMenuBarRebar = IsShowingMenuBarRebar(win);
     curState.aiChatVisible = win->uiState.aiChatVisible;
+    curState.webPanelVisible = win->uiState.webPanelVisible;
     curState.aiChatDx = win->aiChatDx;
     curState.sidebarOnRight = SidebarOnRightLayout();
 
@@ -6886,7 +6906,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
         bool favVis = favAsTab || ui.favVisible;
         bool tocVis = !favAsTab && ui.tocVisible;
         bool libraryVis = !favAsTab && ui.libraryVisible;
-        bool aiVis = !favAsTab && ui.aiChatVisible;
+        bool aiVis = !favAsTab && ui.aiChatVisible && !ui.webPanelVisible;
+        bool webVis = !favAsTab && ui.webPanelVisible && !ui.aiChatVisible;
         win->librarySplitter->SetIsVisible(libraryVis);
         HwndSetVisible(win->hwndLibraryBox, libraryVis);
         win->sidebarSplitter->SetIsVisible(!favAsTab && (tocVis || favVis));
@@ -6898,7 +6919,15 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
         HwndSetVisible(win->hwndCanvas, !favAsTab);
         if (win->hwndAiChatBox) {
             HwndSetVisible(win->hwndAiChatBox, aiVis);
+        }
+        if (win->hwndWebPanelBox) {
+            HwndSetVisible(win->hwndWebPanelBox, webVis);
+        }
+        if (win->aiChatSplitter) {
             win->aiChatSplitter->SetIsVisible(aiVis);
+        }
+        if (win->webPanelSplitter) {
+            win->webPanelSplitter->SetIsVisible(webVis);
         }
     }
 
@@ -6961,7 +6990,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     bool tocVisible = !favAsTab && win->uiState.tocVisible;
     bool sidebarVisible = !favAsTab && (tocVisible || win->uiState.favVisible);
     bool libraryVisible = !favAsTab && win->uiState.libraryVisible;
-    bool aiChatVisible = !favAsTab && win->uiState.aiChatVisible && win->hwndAiChatBox;
+    bool webPanelVisible = !favAsTab && win->uiState.webPanelVisible && win->hwndWebPanelBox && !win->uiState.aiChatVisible;
+    bool aiChatVisible = !favAsTab && win->uiState.aiChatVisible && win->hwndAiChatBox && !win->uiState.webPanelVisible;
     bool showCaption = !win->presentation && !win->isFullScreen && win->tabsInTitlebar;
     bool showingMenuBar = IsShowingMenuBarRebar(win);
     bool showTabsBar = !win->presentation && !win->isFullScreen && !win->tabsInTitlebar && win->tabsVisible;
@@ -7087,6 +7117,24 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
         aiChatDx = limitValue(aiChatDx, kSidebarMinDx, availDx / 2);
         win->aiChatDx = aiChatDx;
     }
+    int webPanelDx = 0;
+    if (webPanelVisible) {
+        webPanelDx = win->webPanelDx > 0 ? win->webPanelDx : win->aiChatDx;
+        if (webPanelDx <= 0) {
+            webPanelDx = gGlobalPrefs->aiChatSidebarDx > 0 ? gGlobalPrefs->aiChatSidebarDx : rc.dx * 3 / 8;
+        }
+        int usedLeft = (sidebarVisible ? sidebarDxApplied + kSplitterDx : 0) +
+                       (libraryVisible ? libraryDxApplied + kSplitterDx : 0) +
+                       (aiChatVisible ? aiChatDx + kSplitterDx : 0);
+        // leave kMinDocCanvasDx for the document; allow web panel to take the rest
+        int maxWebDx = std::max(kSidebarMinDx, rc.dx - usedLeft - kMinDocCanvasDx);
+        webPanelDx = limitValue(webPanelDx, kSidebarMinDx, maxWebDx);
+        win->webPanelDx = webPanelDx;
+        win->aiChatDx = webPanelDx;
+        if (gGlobalPrefs->aiChatSidebarDx != webPanelDx) {
+            gGlobalPrefs->aiChatSidebarDx = webPanelDx;
+        }
+    }
 
     // sidebar favorites vs. the full-window Favorites tab: same HWND, one slot
     bool sidebarFav = !favAsTab && win->uiState.favVisible;
@@ -7099,12 +7147,17 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     SetVis(win->sidebarSplitter, sidebarVisible);
     SetVis(win->aiChatSplitter, aiChatVisible);
     SetVis(win->aiChatSlot, aiChatVisible);
+    SetVis(win->webPanelSplitter, webPanelVisible);
+    SetVis(win->webPanelSlot, webPanelVisible);
 
     win->librarySlot->dx = libraryDxApplied;
     win->tocSlot->dx = sidebarDxApplied;
     win->tocSlot->dy = tocDy;
     win->favSlot->dx = sidebarDxApplied;
     win->aiChatSlot->dx = aiChatDx;
+    if (win->webPanelSlot) {
+        win->webPanelSlot->dx = webPanelDx;
+    }
     if (win->frameLayout) {
         win->frameLayout->rtl = SidebarOnRightLayout();
     }
@@ -7131,6 +7184,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     BindSlot(win->fullFavSlot, win->hwndFavBox, &dh, favAsTab);
     BindSlot(win->canvasSlot, win->hwndCanvas, &dh, !discardCanvasBits);
     BindSlot(win->aiChatSlot, win->hwndAiChatBox, &dh, aiChatVisible);
+    BindSlot(win->webPanelSlot, win->hwndWebPanelBox, &dh, webPanelVisible);
 
     LayoutToSize(win->chromeLayout, {rc.dx, rc.dy});
     win->chromeLayout->SetBounds(rc);
@@ -7149,12 +7203,18 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
         if (sidebarFav) {
             StretchHwndHeight(dh, win->hwndFavBox, win->favSlot->lastBounds);
         }
+        if (aiChatVisible && win->hwndAiChatBox && win->aiChatSlot) {
+            StretchHwndHeight(dh, win->hwndAiChatBox, win->aiChatSlot->lastBounds);
+        }
+        if (webPanelVisible && win->hwndWebPanelBox && win->webPanelSlot) {
+            StretchHwndHeight(dh, win->hwndWebPanelBox, win->webPanelSlot->lastBounds);
+        }
     }
 
     HwndSlot* chromeSlots[] = {win->librarySlot,        win->tabsSlot,          win->menuSlot,    win->toolbarTopSlot,
                                win->captionToolbarSlot, win->toolbarBottomSlot, win->capMenuSlot, win->capTabsRow1,
                                win->capTabsRow2,        win->tocSlot,           win->favSlot,     win->fullFavSlot,
-                               win->canvasSlot,         win->aiChatSlot};
+                               win->canvasSlot,         win->aiChatSlot,        win->webPanelSlot};
     for (HwndSlot* s : chromeSlots) {
         ClearSlotDefer(s);
     }
@@ -7243,6 +7303,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     }
     if (win->uiState.aiChatVisible && win->hwndAiChatBox) {
         RelayoutAIChatPanel(win);
+    }
+    if (win->uiState.webPanelVisible && win->hwndWebPanelBox) {
+        RelayoutWebPanel(win);
     }
     // A frame-size drag does not move the splitter; invalidating it paints a
     // 1-2px strip against the TOC and looks like the tree is shimmering.
@@ -7522,6 +7585,7 @@ static void ApplyMainWindowDpiChromeRefresh(MainWindow* win, HWND hwnd) {
     ApplySidebarDpiFonts(win, dpi);
     HomePageOnDpiChanged(win, dpi);
     UpdateAIChatDpi(win, dpi);
+    UpdateWebPanelDpi(win, dpi);
 
     // window margin / page spacing are dpi-scaled, so they change too
     DisplayModel* dm = win->AsFixed();
@@ -10840,6 +10904,11 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
         case CmdToggleLibrary:
             SetLibraryPanelVisible(win, !win->uiState.libraryVisible);
+            ToolbarUpdateStateForWindow(win, false);
+            break;
+
+        case CmdToggleWebSidebar:
+            OnWebPanelToggle(win);
             ToolbarUpdateStateForWindow(win, false);
             break;
 

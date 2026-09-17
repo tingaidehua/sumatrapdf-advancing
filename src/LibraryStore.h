@@ -28,6 +28,9 @@ struct LibraryBook {
     i64 lastReadMs = 0;
     i64 sortPos = 0;
     u32 bgColor = 0; // 0 = none, else 0x00RRGGBB
+    // JSON blob for NotebookLM placement, e.g.
+    // {"notebook":"SumatraPDF1","notebookId":"...","notebookUrl":"...","sourceTitle":"...","updatedMs":0}
+    Str notebooklm;
 };
 
 struct LibraryCollection {
@@ -73,6 +76,12 @@ bool LibraryStoreSetBookOnDesk(LibraryStore* store, i64 bookId, bool onDesk);
 bool LibraryStoreRemoveBook(LibraryStore* store, i64 bookId);
 bool LibraryStoreSetBookBgColor(LibraryStore* store, i64 bookId, u32 bgColor);
 bool LibraryStoreSetCollectionBgColor(LibraryStore* store, i64 collectionId, u32 bgColor);
+bool LibraryStoreSetBookNotebookLm(LibraryStore* store, i64 bookId, Str notebooklmJson);
+Str LibraryStoreGetBookNotebookLm(LibraryStore* store, i64 bookId); // owned; caller frees
+LibraryBook* LibraryStoreFindBookByPath(LibraryStore* store, Str path); // owned; caller DeleteLibraryBook
+LibraryBook* LibraryStoreFindBookById(LibraryStore* store, i64 bookId); // owned; caller DeleteLibraryBook
+// Rename file on disk path + update books.path/title/path_key. newBaseName includes .pdf.
+bool LibraryStoreRenameBookFile(LibraryStore* store, i64 bookId, Str newBaseName, Str* outNewPath);
 
 Vec<LibraryPathChange*> LibraryStorePreviewPathReplace(LibraryStore* store, Str oldPrefix, Str newPrefix);
 bool LibraryStoreApplyPathReplace(LibraryStore* store, Vec<LibraryPathChange*>& changes);

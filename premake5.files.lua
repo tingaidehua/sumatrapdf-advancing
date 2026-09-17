@@ -635,6 +635,7 @@ function sumatrapdf_files()
     "EmbeddedResources.*",
     "AIChatCommon.*",
     "AIChatPanel.*",
+    "WebPanel.*",
     "AIAntiGravity.*",
     "AIClaudeCode.*",
     "AICodexBuild.*",

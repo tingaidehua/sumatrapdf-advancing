@@ -1,0 +1,19 @@
+{
+  "name": "sumatrapdf-webview-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CDP/Playwright bridge between SumatraPDF WebPanel and sites (NotebookLM, …) — AI/Cursor closed loop",
+  "scripts": {
+    "watch": "node watch-jobs.mjs",
+    "add": "node notebooklm-add.mjs",
+    "select": "node notebooklm-select.mjs",
+    "chat": "node notebooklm-chat.mjs",
+    "cli": "node cli.mjs",
+    "flywheel": "node flywheel.mjs",
+    "status": "node cli.mjs status"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
